@@ -37,7 +37,11 @@ Q = 82
 SS = 2               # 4:2:0，编码快一倍、体积小一半；1:1 读字几乎无差
 IDLE_HOLD_MS = 600000  # 没人动超过 10 分钟就彻底停采集（CPU 归零），一动立刻醒
 CFG_PATH = os.environ.get("EYE_RUNTIME") or os.path.join(os.path.expanduser("~"), ".dsh", "eye-runtime.json")   # 面板改的参数存这儿，重启采集也记得
-DEFAULTS = {"near_fps": 20, "idle_fps": 2, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
+DEFAULTS = {"near_fps": 20, "idle_fps": 5, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
+# 自适应帧率：按「帧间变化」决定这一拍多快，而不是只看有没有人动。
+# 求稳优先——下限 5fps，慢推镜/缓慢滚动也掉不下来；真静止才落到下限。
+MOVE_DIFF = 5.0        # 帧间平均差 ≥ 这个值 → 判「在动」，直接拉满
+SLOW_DIFF = 2.0        # ≥ 这个值 → 判「在慢慢动」，取中间档（动态壁纸常年 1~1.5，会被当成静止）
 mode = {"fps": FPS_LO, "paused": False}
 ring = collections.deque(maxlen=int(FPS_HI * SPAN) + 5)
 SLOW_STEP = 2.0        # 远期层：每 2 秒一张，全是原分辨率原画质，字照样清
@@ -82,11 +86,12 @@ def _thumb(im):
 def _put_thumb(ts, im):
     t = _thumb(im)
     if t is None:
-        return
+        return None
     with th_lock:
         THUMBS[ts] = t
         while len(THUMBS) > TH_KEEP:
             THUMBS.popitem(last=False)
+    return t
 # 对话框：不经过 QQ，跟鲸鲸实时说话（看视频/一起玩的时候用）。只放内存，不落盘。
 CHAT = collections.deque(maxlen=400)
 CHAT_ID = [0]
@@ -178,6 +183,8 @@ def capture():
     fps = FPS_LO
     mode["fps"] = fps; stats["mode"] = fps
     cnt = 0; t0 = time.time()
+    prev_thumb = [None]
+    mid_fps = max(FPS_LO + 1, min(FPS_HI, (FPS_HI + FPS_LO) // 2))
     while True:
         # 久无人动就停采集：只剩 1 秒一次的 idle 查询，CPU 基本归零
         while True:
@@ -190,7 +197,13 @@ def capture():
             time.sleep(1.0)
         mode["paused"] = False
         stats["paused"] = False
-        want = FPS_HI if (0 <= idle_ms() < 1200) else FPS_LO
+        d = stats.get("diff")
+        if 0 <= idle_ms() < 1200 or (d is not None and d >= MOVE_DIFF):
+            want = FPS_HI
+        elif d is not None and d >= SLOW_DIFF:
+            want = mid_fps
+        else:
+            want = FPS_LO
         if want != fps:
             fps = want; mode["fps"] = fps; stats["mode"] = fps
         t_start = time.time()
@@ -204,6 +217,12 @@ def capture():
             _put_thumb(ts, im)
         except Exception as e:
             stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
+        arr = _put_thumb(ts, im)
+        if arr is not None:
+            p = prev_thumb[0]
+            if p is not None and getattr(p, "shape", None) == arr.shape:
+                stats["diff"] = round(float(np.mean(np.abs(arr - p))), 2)
+            prev_thumb[0] = arr
         cnt += 1
         if cnt % 20 == 0:
             stats["fps"] = round(cnt / max(1e-6, time.time() - t0), 1)
@@ -567,7 +586,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
                         "size": [W, H], "cursor": [x, y], "clicks": len(clicks),
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
-                        "err": stats["err"], "paused": bool(mode.get("paused")),
+                        "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"),
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
         if u.path == "/config":
