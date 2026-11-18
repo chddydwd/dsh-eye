@@ -38,7 +38,11 @@ plg = get('http://127.0.0.1:%s/dsh-eye/state' % port)
 
 problems = []
 alive = bool(plg.get('alive'))
-if not alive: problems.append('采集进程不在了')
+plg_err = plg.get('__err')
+if plg_err:
+    problems.append('插件状态读不到（DSH 端口可能不对：%s）' % str(plg_err)[:60])
+elif not alive:
+    problems.append('采集进程不在了')
 if eye.get('__err'): problems.append('采集端 /state 读不到：' + str(eye.get('__err'))[:60])
 if eye.get('err'): problems.append('采集端报错：' + str(eye.get('err'))[:80])
 fps = eye.get('fps')
@@ -52,6 +56,10 @@ print('结论：' + verdict)
 print('采集：' + json.dumps({k: eye.get(k) for k in ('frames', 'fps', 'span_sec', 'slow_frames', 'slow_span_sec', 'paused', 'err')}, ensure_ascii=False))
 print('活动：' + json.dumps({k: act.get(k) for k in ('score', 'idle_ms', 'title', 'ago')}, ensure_ascii=False))
 print('参数：' + json.dumps({k: cfg.get(k) for k in ('near_fps', 'near_span', 'quality', 'est_mem_mb', 'frame_kb')}, ensure_ascii=False))
-print('提醒：' + json.dumps({k: w.get(k) for k in ('on', 'mode', 'threshold', 'gapSec', 'lastScore', 'lastErr')}, ensure_ascii=False)
-      + ' 事件数=' + str(len(w.get('events') or [])))
+if plg_err:
+    print('提醒：读不到（插件状态没拿到，先确认 DSH 端口）')
+else:
+    print('提醒：' + json.dumps({k: w.get(k) for k in ('on', 'mode', 'threshold', 'gapSec', 'lastScore', 'lastErr')}, ensure_ascii=False)
+          + ' 事件数=' + str(len(w.get('events') or [])))
 print('进程：' + json.dumps(procs(), ensure_ascii=False))
+print('端口：' + port)
