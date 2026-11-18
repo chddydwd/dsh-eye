@@ -26,8 +26,52 @@ def _screen_size():
         pass
     return 1920, 1080
 
+def _dpi_scale():
+    try:
+        u = ctypes.windll.user32
+        u.SetProcessDPIAware()
+        hdc = u.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)
+        u.ReleaseDC(0, hdc)
+        return round(dpi / 96.0, 2) if dpi else 1.0
+    except Exception:
+        return 1.0
+
+def _refresh_hz():
+    """主屏刷新率（多屏时其它屏的刷新率不一定相同，这里只报主屏的）。"""
+    try:
+        u = ctypes.windll.user32
+
+        class DEVMODEW(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", ctypes.c_ushort),
+                ("dmDriverVersion", ctypes.c_ushort), ("dmSize", ctypes.c_ushort),
+                ("dmDriverExtra", ctypes.c_ushort), ("dmFields", ctypes.c_ulong),
+                ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
+                ("dmDisplayOrientation", ctypes.c_ulong), ("dmDisplayFixedOutput", ctypes.c_ulong),
+                ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
+                ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short),
+                ("dmCollate", ctypes.c_short), ("dmFormName", ctypes.c_wchar * 32),
+                ("dmLogPixels", ctypes.c_ushort), ("dmBitsPerPel", ctypes.c_ulong),
+                ("dmPelsWidth", ctypes.c_ulong), ("dmPelsHeight", ctypes.c_ulong),
+                ("dmDisplayFlags", ctypes.c_ulong), ("dmDisplayFrequency", ctypes.c_ulong),
+                ("dmICMMethod", ctypes.c_ulong), ("dmICMIntent", ctypes.c_ulong),
+                ("dmMediaType", ctypes.c_ulong), ("dmDitherType", ctypes.c_ulong),
+                ("dmReserved1", ctypes.c_ulong), ("dmReserved2", ctypes.c_ulong),
+                ("dmPanningWidth", ctypes.c_ulong), ("dmPanningHeight", ctypes.c_ulong),
+            ]
+        dm = DEVMODEW(); dm.dmSize = ctypes.sizeof(DEVMODEW)
+        if u.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)) and dm.dmDisplayFrequency:
+            return int(dm.dmDisplayFrequency)
+    except Exception:
+        pass
+    return 0
+
 FF = _find_ff()
 W, H = _screen_size()
+DPI = _dpi_scale()
+REFRESH = _refresh_hz()
+MON = {"i": 1}            # 抓哪块屏：0 = 所有屏拼起来，1..n = 第 n 块（mss 的编号）
 PORT = int(os.environ.get("EYE_PORT") or 13201)
 FPS_HI = 20          # 有人在动（鼠标/键盘最近 1.2 秒内有过）时的采样率
 FPS_LO = 2           # 屏幕闲着时的采样率：没人动的时候画面本来就不变，2fps 足够，CPU 再砍一半
@@ -234,7 +278,7 @@ def capture():
     try:
         import mss
         s = mss.MSS()
-        mon = s.monitors[1]
+        mon = mon_box()
     except Exception as e:
         stats["err"] = "mss-unavailable: " + repr(e)[:120]
         return capture_ffmpeg()
@@ -273,7 +317,9 @@ def capture():
             fps = want; mode["fps"] = fps; stats["mode"] = fps
         t_start = time.time()
         try:
-            raw = s.grab(region_box() or mon)   # 框选区域每帧现读，选完立刻生效，不用重启
+            mons = s.monitors
+            idx = MON["i"] if 0 <= MON["i"] < len(mons) else (1 if len(mons) > 1 else 0)
+            raw = s.grab(region_box() or mons[idx])   # 框选区域/选中屏每帧现读，选完立刻生效，不用重启
             im = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             ts = time.time()
@@ -531,6 +577,16 @@ def _load_auto():
     except Exception:
         pass
 _load_auto()
+
+def _load_mon():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            v = (json.load(f) or {}).get("monitor")
+        if isinstance(v, (int, float)) and 0 <= int(v) <= 16:
+            MON["i"] = int(v)
+    except Exception:
+        pass
+_load_mon()
 AUTO["cap"] = FPS_HI   # 跟着当前性能档起跳
 
 def region_box():
@@ -540,14 +596,42 @@ def region_box():
                 "width": int(REGION["w"]), "height": int(REGION["h"])}
     return None
 
+def monitor_list():
+    """mss 的显示器清单：0 = 所有屏拼起来，1..n = 每块屏（物理像素）。拿不到就退回主屏。"""
+    try:
+        import mss
+        s = mss.MSS()
+        out = []
+        for i, m in enumerate(s.monitors):
+            out.append({"i": i, "left": int(m["left"]), "top": int(m["top"]),
+                        "width": int(m["width"]), "height": int(m["height"])})
+        return out
+    except Exception:
+        return [{"i": 1, "left": 0, "top": 0, "width": W, "height": H}]
+
+def mon_box():
+    lst = monitor_list()
+    for m in lst:
+        if m["i"] == MON["i"]:
+            return {"left": m["left"], "top": m["top"], "width": m["width"], "height": m["height"]}
+    for m in lst:
+        if m["i"] == 1:
+            return {"left": m["left"], "top": m["top"], "width": m["width"], "height": m["height"]}
+    return {"left": 0, "top": 0, "width": W, "height": H}
+
+def base_box():
+    """这一帧实际抓的矩形：框选优先，否则当前选中的那块屏。"""
+    return region_box() or mon_box()
+
 def frame_size():
-    b = region_box()
-    return (b["width"], b["height"]) if b else (W, H)
+    b = base_box()
+    return (b["width"], b["height"])
 
 def save_cfg():
     try:
         payload = dict(CFG); payload["region"] = dict(REGION); payload["hooks"] = bool(HOOK["want"])
         payload["auto"] = bool(AUTO["on"])
+        payload["monitor"] = int(MON["i"])
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -583,6 +667,10 @@ def apply_cfg(q):
         v = _clamp(q["near_span"], 5, 180); SPAN = v or SPAN
     if "far_step" in q:
         v = _clamp(q["far_step"], 0.5, 30); SLOW_STEP = v or SLOW_STEP
+    if "monitor" in q:
+        v = _clamp(q["monitor"], 0, 16)
+        if v is not None:
+            MON["i"] = int(v)
     if "quality" in q:
         v = _clamp(q["quality"], 50, 95); Q = int(v) if v else Q
     if "far_sec" in q:
@@ -812,6 +900,7 @@ class Handler(BaseHTTPRequestHandler):
             x, y = get_cursor()
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
                         "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "cursor": [x, y], "clicks": len(clicks),
+                        "monitor": dict({"i": MON["i"]}, **mon_box()), "monitors": monitor_list(), "dpi": DPI, "refresh": REFRESH,
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
                         "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"), "want": stats.get("want"), "idle_ms": idle_ms(), "cnt": stats.get("cnt"),
                         "hooks": {"want": bool(HOOK["want"]), "on": bool(HOOK["on"]), "ok": bool(HOOK["ok"]),
@@ -820,6 +909,19 @@ class Handler(BaseHTTPRequestHandler):
                         "auto": {"on": bool(AUTO["on"]), "cap": AUTO["cap"], "avg_ms": AUTO["avg_ms"], "note": AUTO["note"]},
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
+        if u.path == "/monitors":
+            self._json({"monitors": monitor_list(), "current": MON["i"], "dpi": DPI, "refresh": REFRESH,
+                        "hint": "0 = 所有屏拼起来，1..n = 第 n 块屏（按左上角坐标排序）；换屏后近层会清空重新抓"}); return
+        if u.path == "/monitor":
+            if "i" in q:
+                v = _clamp(q.get("i"), 0, 16)
+                if v is not None:
+                    MON["i"] = int(v)
+                with lock:
+                    ring.clear()
+                slow.clear()
+                save_cfg()
+            self._json(dict({"i": MON["i"], "monitors": monitor_list()}, **mon_box())); return
         if u.path == "/auto":
             if "on" in q:
                 v = str(q.get("on")).strip().lower() in ("1", "true", "on", "yes")
@@ -945,8 +1047,8 @@ class Handler(BaseHTTPRequestHandler):
                 FW, FH = frame_size()
                 if u.path == "/fovea_at_cursor":
                     cx, cy = get_cursor()
-                    if region_box():          # 抓的是框选区域时，把屏幕坐标换成帧内坐标
-                        cx -= int(REGION["x"]); cy -= int(REGION["y"])
+                    bb = base_box()           # 屏幕坐标 → 帧内坐标（框选区域或选中屏的左上角）
+                    cx -= int(bb["left"]); cy -= int(bb["top"])
                 else:
                     cx = i_("cx", FW // 2); cy = i_("cy", FH // 2)
                 x0 = max(0, min(FW - fw, cx - fw // 2)); y0 = max(0, min(FH - fh, cy - fh // 2))
