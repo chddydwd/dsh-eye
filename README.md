@@ -127,6 +127,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 验收标准：干净的 DSH profile，插件列表只挂 dsh-eye，面板 / 工具 / 采集 / 对话框 / 读字全都正常，才算可发布。
 
+2026-11-18 已按这条路实测过一遍：造一个空的 `DSH_HOME`（只有 `profiles/bare` 和一个 link 到 dsh-eye 的 dependency），跑 `install.ps1 -Profile bare -SkipDeps` 装进去，再用无头宿主起这个 profile。`/dsh-eye/state`、`/dsh-eye/client.js`、`/dsh-eye/doctor` 全部正常，读到的设置来自这个空 home 的 `eye.json`（不再是安装机器的）。这一步顺手抓出两处「换机器就错」的硬编码：启动时读设置的那一行写死了原主人的 `eye.json`，以及 `persistEye()` 保存时会把安装器写的 `paths` 键冲掉——都修掉了。
+
 ## 隐私
 
 - 画面只在内存里，不写磁盘、不联网（只监听 127.0.0.1）。
