@@ -866,6 +866,67 @@ def activity_loop():
                     "fg": fgi, "fg_at": fgi["at"] if fgi else 0.0,
                     "fg_changed": bool(fgi and fgi["changed"])})
 
+def _ps_run(script, args, timeout=30):
+    """Run one bundled PowerShell helper, passing an output JSON path; returns parsed dict."""
+    ps = shutil.which('powershell') or shutil.which('pwsh')
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
+    if not ps or not os.path.exists(path):
+        return {"ok": False, "err": "missing " + script}
+    out = os.path.join(os.environ.get('TEMP') or '.', 'dsh-eye-ps-%d-%d.json' % (os.getpid(), int(time.time() * 1000) % 100000))
+    try:
+        subprocess.run([ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path] + [str(a) for a in args] + [out],
+                       capture_output=True, timeout=timeout)
+        with open(out, 'r', encoding='utf-8') as fh:
+            return json.loads(fh.read() or '{}')
+    except Exception as e:
+        return {"ok": False, "err": str(e)[:160]}
+    finally:
+        try:
+            os.remove(out)
+        except Exception:
+            pass
+
+
+def text_from_window(hwnd=0, maxn=120):
+    """UI Automation: real control names / values / document text of a window (no pixels, no tokens until asked)."""
+    d = _ps_run('eye_text.ps1', [int(hwnd or 0), max(5, min(400, int(maxn)))])
+    if not d.get('ok'):
+        return d
+    words = []
+    for nd in d.get('nodes') or []:
+        t = (nd.get('t') or '').strip()
+        if t:
+            words.append(t[:2000])
+            continue
+        v = (nd.get('v') or '').strip()
+        if v:
+            words.append(v[:400])
+            continue
+        nm = (nd.get('n') or '').strip()
+        if nm:
+            words.append(nm[:200])
+    d['text'] = '\n'.join(words)[:8000]
+    d['readable'] = len([w for w in words if len(w) > 1])
+    return d
+
+
+def text_from_pixels(jb, maxn=80):
+    """OCR one JPEG frame with the Windows built-in engine (offline). Quality is rough on small UI text."""
+    tmp = os.path.join(os.environ.get('TEMP') or '.', 'dsh-eye-ocr-%d.jpg' % int(time.time() * 1000))
+    try:
+        with open(tmp, 'wb') as fh:
+            fh.write(jb)
+        d = _ps_run('eye_ocr.ps1', [tmp, max(1, min(400, int(maxn)))])
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+    if d.get('ok'):
+        d['text'] = '\n'.join((l.get('t') or '') for l in d.get('lines') or [])[:8000]
+    return d
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def _cors(self):
@@ -1076,6 +1137,29 @@ class Handler(BaseHTTPRequestHandler):
             d = best[1]
             self.send_response(200); self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d); return
+        if u.path == "/text":
+            hwnd = i_("hwnd", 0)
+            if not hwnd:
+                try:
+                    hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                except Exception:
+                    hwnd = 0
+            mx = max(5, min(400, i_("max", 120)))
+            mode = (q.get("mode") or ["auto"])[0]
+            d = {"ok": False, "err": "skipped"}
+            if mode != "ocr":
+                d = text_from_window(hwnd, mx)
+            got = int(d.get("readable") or 0) if d.get("ok") else 0
+            if mode == "ocr" or (mode == "auto" and got < 3):
+                items = snapshot()
+                ocr = text_from_pixels(items[-1][1], min(120, mx)) if items else {"ok": False, "err": "no frames"}
+                if mode == "ocr":
+                    d = ocr
+                elif got == 0:
+                    d = ocr
+                else:
+                    d["ocr"] = ocr
+            self._json(d); return
         if u.path == "/activity":
             a = dict(act)
             a["ago"] = round(time.time() - a["at"], 2) if a["at"] else None

@@ -47,7 +47,7 @@ foreach ($f in @('package.json','cordis.patch.yml','README.md','LICENSE')) {
   $src = Join-Path $Root $f
   if (Test-Path $src) { Copy-Item -Force $src (Join-Path $Dest $f) }
 }
-Get-ChildItem -Path (Join-Path $Root 'python') -Filter *.py | ForEach-Object { Copy-Item -Force $_.FullName (Join-Path $PyDest $_.Name) }
+Get-ChildItem -Path (Join-Path $Root 'python') -File | Where-Object { $_.Extension -in '.py', '.ps1' } | ForEach-Object { Copy-Item -Force $_.FullName (Join-Path $PyDest $_.Name) }
 Copy-Item -Force (Join-Path $Root 'python\requirements.txt') (Join-Path $PyDest 'requirements.txt')
 Get-ChildItem -Path $PyDest -Filter '__pycache__' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
