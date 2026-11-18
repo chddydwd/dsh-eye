@@ -1145,15 +1145,15 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     hwnd = 0
             mx = max(5, min(400, i_("max", 120)))
-            mode = (q.get("mode") or ["auto"])[0]
+            tmode = (q.get("mode") or ["auto"])[0]
             d = {"ok": False, "err": "skipped"}
-            if mode != "ocr":
+            if tmode != "ocr":
                 d = text_from_window(hwnd, mx)
             got = int(d.get("readable") or 0) if d.get("ok") else 0
-            if mode == "ocr" or (mode == "auto" and got < 3):
+            if tmode == "ocr" or (tmode == "auto" and got < 3):
                 items = snapshot()
                 ocr = text_from_pixels(items[-1][1], min(120, mx)) if items else {"ok": False, "err": "no frames"}
-                if mode == "ocr":
+                if tmode == "ocr":
                     d = ocr
                 elif got == 0:
                     d = ocr
