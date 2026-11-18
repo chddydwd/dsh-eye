@@ -98,6 +98,42 @@ CHAT = collections.deque(maxlen=400)
 CHAT_ID = [0]
 chat_lock = threading.Lock()
 WIN = {"hwnd": 0, "at": 0.0}   # 小窗心跳：窗口由插件起还是外面起，都能认出来
+# 鼠标钩子（实验，默认关）：用系统事件通知，代替「每 20ms 问一次按键」。回调跑在系统输入线程里，
+# 里面只做一件事——时间戳+坐标塞队列；查窗口、抓帧全留给采集线程，不然全系统输入都被拖慢。
+HOOK = {"want": False, "on": False, "ok": False, "err": "", "events": 0,
+        "at": 0.0, "burst": 0.0, "stop": False, "tid": 0}
+HOOK_Q = collections.deque(maxlen=200)
+hook_lock = threading.Lock()
+
+def hooks_load():
+    """配置里 "hooks": true 或环境变量 EYE_HOOKS=1 才开（默认关）。"""
+    v = False
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            v = bool((json.load(f) or {}).get("hooks"))
+    except Exception:
+        pass
+    if (os.environ.get("EYE_HOOKS") or "").strip().lower() in ("1", "true", "on", "yes"):
+        v = True
+    return v
+
+def drain_hook_clicks():
+    """采集线程里消费钩子事件：查窗口标题、打事件标记（这些开销绝不能进钩子回调）。"""
+    got = 0
+    while True:
+        try:
+            ts, hx, hy, bt = HOOK_Q.popleft()
+        except IndexError:
+            break
+        try:
+            hwnd = user32.WindowFromPoint(POINT(hx, hy))
+        except Exception:
+            hwnd = 0
+        clicks.append({"ts": ts, "x": hx, "y": hy, "btn": bt, "hwnd": int(hwnd or 0),
+                       "title": win_title(hwnd or 0)[:120], "src": "hook"})
+        HOOK["burst"] = ts
+        got += 1
+    return got
 
 def chat_add(frm, text, kind="chat"):
     with chat_lock:
@@ -222,6 +258,8 @@ def capture():
                 ring.append((ts, b.getvalue())); stats["n"] = len(ring)
         except Exception as e:
             stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
+        if HOOK_Q:
+            drain_hook_clicks()
         past = None
         with th_lock:
             for t_, a_ in reversed(THUMBS.items()):
@@ -243,6 +281,8 @@ def capture():
         dt = time.time() - t_start
         stats["ms"] = round(dt * 1000, 1)
         gap = 1.0 / fps - dt
+        if HOOK["on"] and time.time() - HOOK["burst"] < 0.35:
+            gap = 0.0        # 刚点了鼠标：下一帧立刻抓，别等 idle 那 200ms
         if gap > 0:
             time.sleep(gap)
 
@@ -299,15 +339,99 @@ def pointer():
     while True:
         ts = time.time(); x, y = get_cursor()
         trail.append((ts, x, y))
-        down = bool(user32.GetAsyncKeyState(0x01) & 0x8000) or bool(user32.GetAsyncKeyState(0x02) & 0x8000)
-        if down and not last_btn:
-            try:
-                hwnd = user32.WindowFromPoint(POINT(x, y))
-            except Exception:
-                hwnd = 0
-            clicks.append({"ts": ts, "x": x, "y": y, "hwnd": int(hwnd or 0), "title": win_title(hwnd or 0)[:120]})
-        last_btn = down
+        if not (HOOK["on"] and HOOK["ok"]):    # 钩子在工作就别轮询，免得一次点击记两条
+            down = bool(user32.GetAsyncKeyState(0x01) & 0x8000) or bool(user32.GetAsyncKeyState(0x02) & 0x8000)
+            if down and not last_btn:
+                try:
+                    hwnd = user32.WindowFromPoint(POINT(x, y))
+                except Exception:
+                    hwnd = 0
+                clicks.append({"ts": ts, "x": x, "y": y, "hwnd": int(hwnd or 0),
+                               "title": win_title(hwnd or 0)[:120], "src": "poll"})
+            last_btn = down
         time.sleep(0.02)
+
+def _hook_thread():
+    """WH_MOUSE_LL：最轻的一档鼠标钩子。失败就把 err 写上直接退出，轮询自动接回来。"""
+    try:
+        WH_MOUSE_LL = 14
+        WM_DOWN = {0x0201: "L", 0x0204: "R", 0x020B: "M"}   # 左/右/中键按下
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("pt", POINT), ("mouseData", ctypes.c_uint32),
+                        ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32),
+                        ("dwExtraInfo", ctypes.c_void_p)]
+        class MSG(ctypes.Structure):
+            _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint32),
+                        ("wParam", ctypes.c_ssize_t), ("lParam", ctypes.c_ssize_t),
+                        ("time", ctypes.c_uint32), ("x", ctypes.c_long), ("y", ctypes.c_long)]
+        HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_ssize_t, ctypes.c_ssize_t)
+
+        def proc(nCode, wParam, lParam):
+            try:
+                if nCode >= 0:
+                    bt = WM_DOWN.get(int(wParam) & 0xFFFF)
+                    if bt:
+                        info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                        ts = time.time()
+                        if len(HOOK_Q) < 190:
+                            HOOK_Q.append((ts, int(info.pt.x), int(info.pt.y), bt))
+                        HOOK["events"] += 1
+                        HOOK["at"] = ts
+            except Exception:
+                pass
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+
+        cb = HOOKPROC(proc)          # 必须留引用：回调被 GC 掉，钩子就哑了
+        HOOK["tid"] = threading.get_ident()
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        h = user32.SetWindowsHookExW(WH_MOUSE_LL, cb, None, 0)
+        if not h:
+            HOOK["err"] = "SetWindowsHookEx failed (%s)" % ctypes.get_last_error()
+            return
+        HOOK["ok"] = True
+        HOOK["err"] = ""
+        m = MSG()
+        while not HOOK["stop"]:
+            r = user32.GetMessageW(ctypes.byref(m), None, 0, 0)
+            if r == 0 or r == -1:
+                break
+            user32.TranslateMessage(ctypes.byref(m))
+            user32.DispatchMessageW(ctypes.byref(m))
+        user32.UnhookWindowsHookEx(ctypes.c_void_p(h))
+    except Exception as e:
+        HOOK["err"] = repr(e)[:200]
+    finally:
+        HOOK["ok"] = False
+        HOOK["on"] = False          # 线程没了就降级回轮询
+
+def hooks_start():
+    if HOOK["on"]:
+        return True
+    HOOK.update({"on": True, "stop": False, "err": ""})
+    threading.Thread(target=_hook_thread, daemon=True).start()
+    t0 = time.time()
+    while time.time() - t0 < 1.5 and not HOOK["ok"] and not HOOK["err"]:
+        time.sleep(0.05)
+    if not HOOK["ok"]:
+        HOOK["on"] = False
+    return HOOK["ok"]
+
+def hooks_stop():
+    HOOK["stop"] = True
+    tid = HOOK["tid"]
+    if tid:
+        try:
+            user32.PostThreadMessageW(tid, 0x0012, 0, 0)   # WM_QUIT，让消息泵退出
+        except Exception:
+            pass
+    t0 = time.time()
+    while time.time() - t0 < 1.0 and HOOK["on"]:
+        time.sleep(0.05)
+    HOOK["ok"] = False
+    HOOK["on"] = False
+    return True
+
+HOOK["want"] = hooks_load()
 
 def _clamp(v, lo, hi):
     try:
@@ -362,7 +486,7 @@ def frame_size():
 
 def save_cfg():
     try:
-        payload = dict(CFG); payload["region"] = dict(REGION)
+        payload = dict(CFG); payload["region"] = dict(REGION); payload["hooks"] = bool(HOOK["want"])
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -627,8 +751,24 @@ class Handler(BaseHTTPRequestHandler):
                         "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "cursor": [x, y], "clicks": len(clicks),
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
                         "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"), "want": stats.get("want"), "idle_ms": idle_ms(), "cnt": stats.get("cnt"),
+                        "hooks": {"want": bool(HOOK["want"]), "on": bool(HOOK["on"]), "ok": bool(HOOK["ok"]),
+                                  "events": HOOK["events"], "err": HOOK["err"],
+                                  "last_event_ago": round(time.time() - HOOK["at"], 2) if HOOK["at"] else None},
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
+        if u.path == "/hooks":
+            if "on" in q:
+                v = str(q.get("on")).strip().lower() in ("1", "true", "on", "yes")
+                HOOK["want"] = v
+                if v:
+                    hooks_start()
+                else:
+                    hooks_stop()
+                save_cfg()
+            self._json({"want": bool(HOOK["want"]), "on": bool(HOOK["on"]), "ok": bool(HOOK["ok"]),
+                        "events": HOOK["events"], "err": HOOK["err"],
+                        "hint": "默认关。开着时由系统鼠标事件触发抓帧：点下去那一刻有帧、坐标就是真坐标；"
+                                "钩子是系统级的，个别安全软件会提示，接受不了就关掉（关掉立刻回到轮询，功能不丢）"}); return
         if u.path == "/region":
             if "off" in q:
                 REGION.update({"x": 0, "y": 0, "w": 0, "h": 0})
@@ -662,7 +802,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"x": x, "y": y, "trail": tr}); return
         if u.path == "/clicks":
             now = time.time()
-            out = [{"ago": round(now - c["ts"], 2), "x": c["x"], "y": c["y"], "title": c["title"]} for c in list(clicks)[-20:]]
+            out = [{"ago": round(now - c["ts"], 2), "x": c["x"], "y": c["y"], "title": c["title"],
+                    "src": c.get("src", "poll")} for c in list(clicks)[-20:]]
             out.reverse(); self._json({"clicks": out}); return
         if u.path == "/echo_info":
             seg, c = echo_frames(f("before", 1.0), f("after", 1.0))
@@ -812,6 +953,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "unknown"})
 
 if __name__ == "__main__":
+    if HOOK["want"]:
+        hooks_start()
     threading.Thread(target=capture, daemon=True).start()
     threading.Thread(target=pointer, daemon=True).start()
     threading.Thread(target=activity_loop, daemon=True).start()
