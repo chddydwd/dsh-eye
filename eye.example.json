@@ -1,0 +1,13 @@
+{
+  "paths": {
+    "dir": "D:\\eye",
+    "python": "C:\\Python312\\python.exe"
+  },
+  "watch": true,
+  "mode": "toast",
+  "gapSec": 25,
+  "threshold": 20,
+  "maxWakes": 3,
+  "maxPerHour": 12,
+  "autostart": true
+}
