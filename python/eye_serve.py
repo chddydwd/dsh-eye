@@ -334,7 +334,7 @@ def capture():
         try:
             mons = s.monitors
             idx = MON["i"] if 0 <= MON["i"] < len(mons) else (1 if len(mons) > 1 else 0)
-            raw = s.grab(region_box() or mons[idx])   # 框选区域/选中屏每帧现读，选完立刻生效，不用重启
+            raw = s.grab(follow_box() or region_box() or mons[idx])   # 跟随/框选/选中屏每帧现读，改完立刻生效
             im = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             ts = time.time()
@@ -604,6 +604,21 @@ def _load_region():
         pass
 _load_region()
 
+# 跟随鼠标：只抓光标周围一块（默认 960x540，按屏大小夹）。开着时优先于框选区域。
+FOLLOW = {"on": False, "w": 960, "h": 540}
+
+def _load_follow():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            r = (json.load(f) or {}).get("follow")
+        if isinstance(r, dict):
+            FOLLOW["on"] = bool(r.get("on", False))
+            FOLLOW["w"] = max(240, int(r.get("w") or 960))
+            FOLLOW["h"] = max(180, int(r.get("h") or 540))
+    except Exception:
+        pass
+_load_follow()
+
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
 # 这样改过抓取范围、换过屏，框还贴在同一块屏幕上，不会跟偏。只是画面模糊，不等于加密。
 MASK = {"on": True, "rects": [], "auto": []}
@@ -825,9 +840,31 @@ def mon_box():
             return {"left": m["left"], "top": m["top"], "width": m["width"], "height": m["height"]}
     return {"left": 0, "top": 0, "width": W, "height": H}
 
+def follow_box():
+    """跟随鼠标：以光标为中心的一块（夹在选中屏内，位置按 32px 网格量子化，免得帧框每像素抖）。"""
+    if not FOLLOW["on"]:
+        return None
+    try:
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+    except Exception:
+        return None
+    mb = mon_box()
+    fw = min(int(FOLLOW["w"]), mb["width"])
+    fh = min(int(FOLLOW["h"]), mb["height"])
+    left = int(pt.x) - fw // 2
+    top = int(pt.y) - fh // 2
+    left = max(mb["left"], min(left, mb["left"] + mb["width"] - fw))
+    top = max(mb["top"], min(top, mb["top"] + mb["height"] - fh))
+    left -= left % 32
+    top -= top % 32
+    left = max(mb["left"], min(left, mb["left"] + mb["width"] - fw))
+    top = max(mb["top"], min(top, mb["top"] + mb["height"] - fh))
+    return {"left": left, "top": top, "width": fw, "height": fh}
+
 def base_box():
-    """这一帧实际抓的矩形：框选优先，否则当前选中的那块屏。"""
-    return region_box() or mon_box()
+    """这一帧实际抓的矩形：跟随鼠标 > 框选区域 > 当前选中的那块屏。"""
+    return follow_box() or region_box() or mon_box()
 
 def frame_size():
     b = base_box()
@@ -841,6 +878,7 @@ def save_cfg():
         payload["mask"] = {"on": bool(MASK["on"]), "rects": [list(r) for r in MASK["rects"]],
                            "pwd": bool(PWD["on"])}
         payload["sensitive"] = {"on": bool(SENS["on"]), "words": list(SENS["words"])}
+        payload["follow"] = {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -1203,6 +1241,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception: return d
         return f, i_
     def do_GET(self):
+        # 任何一条 GET 出错都别把连接掐了——回一段 JSON 带 traceback，面板/curl 都能看见原因
+        try:
+            self._do_get()
+        except Exception:
+            import traceback as _tb
+            t = _tb.format_exc()
+            try:
+                self._json({"ok": False, "error": "handler crashed", "trace": t[-1800:]})
+            except Exception:
+                pass
+
+    def _do_get(self):
         u = urlparse(self.path); q = {k: v[0] for k, v in parse_qs(u.query).items()}
         f, i_ = self._params(q)
         if u.path == "/state":
@@ -1210,7 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
             span = (items[-1][0] - items[0][0]) if len(items) > 1 else 0
             x, y = get_cursor()
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
-                        "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "cursor": [x, y], "clicks": len(clicks),
+                        "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "follow": {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}, "cursor": [x, y], "clicks": len(clicks),
                         "monitor": dict({"i": MON["i"]}, **mon_box()), "monitors": monitor_list(), "dpi": DPI, "refresh": REFRESH,
                         "mask": {"on": bool(MASK["on"]), "count": len(MASK["rects"]), "rects": [list(r) for r in MASK["rects"]],
                                  "coord": "screen", "pwd": bool(PWD["on"]), "auto": len(MASK["auto"]), "auto_err": PWD["err"],
@@ -1261,6 +1311,24 @@ class Handler(BaseHTTPRequestHandler):
                         "events": HOOK["events"], "err": HOOK["err"],
                         "hint": "默认关。开着时由系统鼠标事件触发抓帧：点下去那一刻有帧、坐标就是真坐标；"
                                 "钩子是系统级的，个别安全软件会提示，接受不了就关掉（关掉立刻回到轮询，功能不丢）"}); return
+        if u.path == "/follow":
+            if "off" in q:
+                FOLLOW["on"] = False
+            elif "on" in q:
+                FOLLOW["on"] = str(q.get("on")).strip().lower() not in ("0", "false", "off", "no")
+            if "w" in q and "h" in q:
+                FOLLOW["w"] = max(240, i_("w", 960))
+                FOLLOW["h"] = max(180, i_("h", 540))
+            with lock:
+                ring.clear(); stats["n"] = 0
+            slow.clear(); slow_bytes[0] = 0
+            act["box"] = None; act["score"] = 0.0
+            save_cfg()
+            fmode = "follow" if FOLLOW["on"] else ("region" if region_box() else "full")
+            self._json({"ok": True, "follow": dict(FOLLOW), "size": list(frame_size()), "mode": fmode,
+                        "hint": ("跟随鼠标：每帧按光标位置抓一块（" + str(FOLLOW["w"]) + "x" + str(FOLLOW["h"]) + "），"
+                                 "光标走到哪儿眼就到哪儿；比全屏省，位置按 32 像素对齐不抖")
+                                if FOLLOW["on"] else "跟随关掉了，回到框选区域/整屏"}); return
         if u.path == "/region":
             if "off" in q:
                 REGION.update({"x": 0, "y": 0, "w": 0, "h": 0})
