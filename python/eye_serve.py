@@ -214,7 +214,7 @@ def capture():
             fps = want; mode["fps"] = fps; stats["mode"] = fps
         t_start = time.time()
         try:
-            raw = s.grab(mon)
+            raw = s.grab(region_box() or mon)   # 框选区域每帧现读，选完立刻生效，不用重启
             im = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             ts = time.time()
@@ -335,10 +335,36 @@ SPAN = float(CFG["near_span"]); SLOW_STEP = float(CFG["far_step"])
 Q = int(CFG["quality"])
 SLOW_MAX = max(60, int(float(CFG["far_sec"]) / max(0.5, SLOW_STEP)))
 
+# 框选抓取区域：只想录一块（聊天窗、视频画面）时用。w/h 为 0 = 抓整屏。
+REGION = {"x": 0, "y": 0, "w": 0, "h": 0}
+
+def _load_region():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            r = (json.load(f) or {}).get("region")
+        if isinstance(r, dict):
+            for k in ("x", "y", "w", "h"):
+                REGION[k] = int(r.get(k) or 0)
+    except Exception:
+        pass
+_load_region()
+
+def region_box():
+    """有效框选区域（mss 用的 dict）；全屏时返回 None。"""
+    if REGION["w"] >= 60 and REGION["h"] >= 60:
+        return {"left": int(REGION["x"]), "top": int(REGION["y"]),
+                "width": int(REGION["w"]), "height": int(REGION["h"])}
+    return None
+
+def frame_size():
+    b = region_box()
+    return (b["width"], b["height"]) if b else (W, H)
+
 def save_cfg():
     try:
+        payload = dict(CFG); payload["region"] = dict(REGION)
         with open(CFG_PATH, "w", encoding="utf-8") as f:
-            json.dump(CFG, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -598,11 +624,36 @@ class Handler(BaseHTTPRequestHandler):
             span = (items[-1][0] - items[0][0]) if len(items) > 1 else 0
             x, y = get_cursor()
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
-                        "size": [W, H], "cursor": [x, y], "clicks": len(clicks),
+                        "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "cursor": [x, y], "clicks": len(clicks),
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
                         "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"), "want": stats.get("want"), "idle_ms": idle_ms(), "cnt": stats.get("cnt"),
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
+        if u.path == "/region":
+            if "off" in q:
+                REGION.update({"x": 0, "y": 0, "w": 0, "h": 0})
+            elif "w" in q and "h" in q:
+                rw = i_("w", 0); rh = i_("h", 0)
+                if rw >= 60 and rh >= 60:
+                    REGION.update({"x": i_("x", 0), "y": i_("y", 0), "w": rw, "h": rh})
+            else:
+                self._json({"region": dict(REGION), "size": list(frame_size()), "screen": [W, H]}); return
+            with lock:
+                ring.clear(); stats["n"] = 0
+            slow.clear(); slow_bytes[0] = 0
+            act["box"] = None; act["score"] = 0.0
+            save_cfg()
+            box = region_box()
+            self._json({"ok": True, "region": dict(REGION), "size": list(frame_size()),
+                        "mode": "region" if box else "full"}); return
+        if u.path == "/region/pick":
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                subprocess.Popen([sys.executable, os.path.join(here, "eye_region.py")],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._json({"ok": True, "hint": "拖一个框，松手生效；点一下不拖或按 Esc = 恢复全屏"}); return
+            except Exception as e:
+                self._json({"ok": False, "error": repr(e)}); return
         if u.path == "/config":
             self._json(apply_cfg(q) if q else cfg_state()); return
         if u.path == "/cursor":
@@ -677,11 +728,14 @@ class Handler(BaseHTTPRequestHandler):
             im = decode(best[1])
             if u.path.startswith("/fovea") or "fw" in q:
                 fw = i_("fw", 700); fh = i_("fh", 393)
+                FW, FH = frame_size()
                 if u.path == "/fovea_at_cursor":
                     cx, cy = get_cursor()
+                    if region_box():          # 抓的是框选区域时，把屏幕坐标换成帧内坐标
+                        cx -= int(REGION["x"]); cy -= int(REGION["y"])
                 else:
-                    cx = i_("cx", W // 2); cy = i_("cy", H // 2)
-                x0 = max(0, min(W - fw, cx - fw // 2)); y0 = max(0, min(H - fh, cy - fh // 2))
+                    cx = i_("cx", FW // 2); cy = i_("cy", FH // 2)
+                x0 = max(0, min(FW - fw, cx - fw // 2)); y0 = max(0, min(FH - fh, cy - fh // 2))
                 im = im.crop((x0, y0, x0 + fw, y0 + fh))
             self._img(im); return
         if u.path in ("/live", "/peek"):
