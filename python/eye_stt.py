@@ -27,6 +27,29 @@ def to_simplified(s):
         return s
 
 
+_PROMPT = "以下是普通话的句子，用简体中文。"
+
+
+def _norm(s):
+    """去掉标点/空白，用来比对。"""
+    drop = "，。,.!！?？、；;：: \u3000\"'“”‘’（）()"
+    return "".join(ch for ch in (s or "") if ch not in drop).lower()
+
+
+def _prompt_echo(s):
+    """Whisper 在静音、噪声、极短音频上会把 initial_prompt 当正文吐出来。
+    这种不是用户说的话，直接丢掉。"""
+    if not s:
+        return True
+    import difflib
+    t = _norm(s)
+    if not t:
+        return True
+    if difflib.SequenceMatcher(None, t, _norm(_PROMPT)).ratio() >= 0.55:
+        return True
+    return ("用简体中文" in s) and ("普通话" in s)
+
+
 MODEL_SIZE = os.environ.get("EYE_STT_MODEL", "small")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _MODEL = None
@@ -93,14 +116,15 @@ def pcm_to_wav_bytes(pcm, rate=16000):
 def transcribe_pcm(pcm, rate=16000, language="zh"):
     """一段 int16 PCM → 文字。"""
     import numpy as np
-    if pcm is None or len(pcm) < rate // 5:
-        return ""   # 太短当没说话
+    if pcm is None or len(pcm) < rate // 2:
+        return ""   # 太短当没说话（半秒以下 Whisper 只会瞎编）
     m = load()
     audio = np.frombuffer(pcm, dtype=np.int16).astype("float32") / 32768.0
     segs, info = m.transcribe(audio, language=language, beam_size=1, vad_filter=True,
                               condition_on_previous_text=False,
-                              initial_prompt="以下是普通话的句子，用简体中文。" if language == "zh" else None)
-    return to_simplified("".join(s.text for s in segs).strip())
+                              initial_prompt=_PROMPT if language == "zh" else None)
+    txt = to_simplified("".join(s.text for s in segs).strip())
+    return "" if _prompt_echo(txt) else txt
 
 
 def transcribe_file(path, language="zh"):
@@ -116,5 +140,6 @@ def transcribe_file(path, language="zh"):
     m = load()
     segs, info = m.transcribe(p, language=language, beam_size=1, vad_filter=True,
                               condition_on_previous_text=False,
-                              initial_prompt="以下是普通话的句子，用简体中文。" if language == "zh" else None)
-    return to_simplified("".join(s.text for s in segs).strip())
+                              initial_prompt=_PROMPT if language == "zh" else None)
+    txt = to_simplified("".join(s.text for s in segs).strip())
+    return "" if _prompt_echo(txt) else txt

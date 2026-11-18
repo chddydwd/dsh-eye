@@ -495,6 +495,13 @@ def _hook_thread():
                         ("wParam", ctypes.c_ssize_t), ("lParam", ctypes.c_ssize_t),
                         ("time", ctypes.c_uint32), ("x", ctypes.c_long), ("y", ctypes.c_long)]
         HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_ssize_t, ctypes.c_ssize_t)
+        # 64 位下 lParam 是 64 位指针。不声明 argtypes 时 ctypes 按 32 位 int 传，
+        # CallNextHookEx 会抛 OverflowError；回调没正常返回，系统就把整条鼠标事件吞掉（表现：钩子一开鼠标卡死）。
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_ssize_t, ctypes.c_ssize_t]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, ctypes.c_uint32]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32]
+        user32.GetMessageW.restype = ctypes.c_int
 
         def proc(nCode, wParam, lParam):
             try:
@@ -510,7 +517,10 @@ def _hook_thread():
                         HOOK["at"] = ts
             except Exception:
                 pass
-            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            try:
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
+            except Exception:
+                return 0            # 兜底：宁可放行也不要把事件链卡住
 
         cb = HOOKPROC(proc)          # 必须留引用：回调被 GC 掉，钩子就哑了
         HOOK["tid"] = threading.get_ident()
