@@ -40,8 +40,8 @@ CFG_PATH = os.environ.get("EYE_RUNTIME") or os.path.join(os.path.expanduser("~")
 DEFAULTS = {"near_fps": 20, "idle_fps": 5, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
 # 自适应帧率：按「帧间变化」决定这一拍多快，而不是只看有没有人动。
 # 求稳优先——下限 5fps，慢推镜/缓慢滚动也掉不下来；真静止才落到下限。
-MOVE_DIFF = 5.0        # 帧间平均差 ≥ 这个值 → 判「在动」，直接拉满
-SLOW_DIFF = 2.0        # ≥ 这个值 → 判「在慢慢动」，取中间档（动态壁纸常年 1~1.5，会被当成静止）
+MOVE_DIFF = 5.0        # 0.6 秒间隔的平均差 ≥ 这个值 → 判「在动」，直接拉满（拖窗口实测 20~47）
+SLOW_DIFF = 3.0        # ≥ 这个值 → 判「在慢慢动」，取中间档（动态壁纸实测 1~1.5，留余量当静止）
 mode = {"fps": FPS_LO, "paused": False}
 ring = collections.deque(maxlen=int(FPS_HI * SPAN) + 5)
 SLOW_STEP = 2.0        # 远期层：每 2 秒一张，全是原分辨率原画质，字照样清
@@ -71,6 +71,7 @@ clicks = collections.deque(maxlen=80)       # dict(ts,x,y,hwnd,title)
 last_btn = 0
 act = {"score": 0.0, "box": None, "at": 0.0, "idle_ms": 0, "title": "", "fg": None, "fg_at": 0.0, "fg_changed": False}   # 最近一次活动检测（供插件主动叫醒）
 FG_LAST = {"hwnd": 0, "at": 0.0}
+ADAPT = {"last_move": 0.0, "hold": 2.0, "win": 0.6}   # 自适应帧率：0.6 秒前的缩略图做差（跟帧率无关），动过之后保持 2 秒
 ACT_TICK = 0.5        # 每 0.5 秒量一次
 ACT_SCALE = (160, 90) # 缩到这个尺寸比，便宜且对整屏变化敏感
 THUMBS = collections.OrderedDict()   # ts -> int16 缩小灰度图（活动检测用，别每次解码整张 JPEG）
@@ -183,6 +184,7 @@ def capture():
     fps = FPS_LO
     mode["fps"] = fps; stats["mode"] = fps
     cnt = 0; t0 = time.time()
+    tsq = collections.deque()
     prev_thumb = [None]
     mid_fps = max(FPS_LO + 1, min(FPS_HI, (FPS_HI + FPS_LO) // 2))
     while True:
@@ -198,12 +200,16 @@ def capture():
         mode["paused"] = False
         stats["paused"] = False
         d = stats.get("diff")
+        now = time.time()
         if 0 <= idle_ms() < 1200 or (d is not None and d >= MOVE_DIFF):
-            want = FPS_HI
+            want = FPS_HI; ADAPT["last_move"] = now
         elif d is not None and d >= SLOW_DIFF:
-            want = mid_fps
+            want = mid_fps; ADAPT["last_move"] = now
+        elif now - ADAPT["last_move"] < ADAPT["hold"]:
+            want = fps            # 刚动过：保持当前档，别在 5/12/20 之间来回抖
         else:
             want = FPS_LO
+        stats["want"] = want
         if want != fps:
             fps = want; mode["fps"] = fps; stats["mode"] = fps
         t_start = time.time()
@@ -214,18 +220,26 @@ def capture():
             ts = time.time()
             with lock:
                 ring.append((ts, b.getvalue())); stats["n"] = len(ring)
-            _put_thumb(ts, im)
         except Exception as e:
             stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
+        past = None
+        with th_lock:
+            for t_, a_ in reversed(THUMBS.items()):
+                if t_ <= ts - ADAPT["win"]:
+                    past = a_; break
         arr = _put_thumb(ts, im)
         if arr is not None:
-            p = prev_thumb[0]
-            if p is not None and getattr(p, "shape", None) == arr.shape:
-                stats["diff"] = round(float(np.mean(np.abs(arr - p))), 2)
+            if past is not None and getattr(past, "shape", None) == arr.shape:
+                stats["diff"] = round(float(np.mean(np.abs(arr - past))), 2)
             prev_thumb[0] = arr
         cnt += 1
-        if cnt % 20 == 0:
-            stats["fps"] = round(cnt / max(1e-6, time.time() - t0), 1)
+        stats["cnt"] = cnt
+        tsq.append(ts)
+        while tsq and tsq[0] < ts - 3.0:
+            tsq.popleft()
+        if cnt % 5 == 0:
+            # 瞬时帧率（最近 3 秒窗口），不跟整段平均混在一起
+            stats["fps"] = round((len(tsq) - 1) / max(1e-6, tsq[-1] - tsq[0]), 1)
         dt = time.time() - t_start
         stats["ms"] = round(dt * 1000, 1)
         gap = 1.0 / fps - dt
@@ -586,7 +600,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
                         "size": [W, H], "cursor": [x, y], "clicks": len(clicks),
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
-                        "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"),
+                        "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"), "want": stats.get("want"), "idle_ms": idle_ms(), "cnt": stats.get("cnt"),
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
         if u.path == "/config":
