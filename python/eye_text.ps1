@@ -25,9 +25,17 @@ function Walk($e, $depth) {
     $t = ''
     try { $tp = $child.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp -ne $null) { $t = $tp.DocumentRange.GetText(4000) } } catch {}
     if (($n -ne '') -or ($v -ne '') -or ($t -ne '') -or $pw) {
-      $r = $child.Current.BoundingRectangle
-      $role = $child.Current.ControlType.ProgrammaticName.Replace('ControlType.','')
-      $null = $script:nodes.Add([pscustomobject]@{ r = $role; n = $n; v = $v; t = $t; p = $pw; x = [int]$r.X; y = [int]$r.Y; w = [int]$r.Width; h = [int]$r.Height })
+      $rx = 0; $ry = 0; $rw = 0; $rh = 0; $role = ''
+      try {
+        $r = $child.Current.BoundingRectangle
+        $role = $child.Current.ControlType.ProgrammaticName.Replace('ControlType.','')
+        # 有的窗口会给出 NaN / Infinity / 天文数字坐标，[int] 转换会抛异常把整棵树的读取打断
+        try { if (-not [double]::IsNaN($r.X) -and -not [double]::IsInfinity($r.X)) { $rx = [int][math]::Max(-2000000, [math]::Min(2000000, $r.X)) } } catch {}
+        try { if (-not [double]::IsNaN($r.Y) -and -not [double]::IsInfinity($r.Y)) { $ry = [int][math]::Max(-2000000, [math]::Min(2000000, $r.Y)) } } catch {}
+        try { if (-not [double]::IsNaN($r.Width) -and -not [double]::IsInfinity($r.Width)) { $rw = [int][math]::Max(0, [math]::Min(2000000, $r.Width)) } } catch {}
+        try { if (-not [double]::IsNaN($r.Height) -and -not [double]::IsInfinity($r.Height)) { $rh = [int][math]::Max(0, [math]::Min(2000000, $r.Height)) } } catch {}
+      } catch {}
+      try { $null = $script:nodes.Add([pscustomobject]@{ r = $role; n = $n; v = $v; t = $t; p = $pw; x = $rx; y = $ry; w = $rw; h = $rh }) } catch {}
     }
     Walk $child ($depth + 1)
     $child = $walker.GetNextSibling($child)
@@ -54,6 +62,27 @@ try {
     } catch {}
   }
 } catch {}
+# Chromium/Edge: Document 常常不在 ControlView 树里，按文档正文再补一段（读不到 t 才补，避免重复）
+$joined = (($nodes | ForEach-Object { $_.t }) -join "`n")
+if ($true) {
+  try {
+    $condD = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Document)
+    $docsD = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condD)
+    foreach ($dD in $docsD) {
+      try {
+        $tpD = $dD.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        if ($tpD -ne $null) {
+          $txtD = $tpD.DocumentRange.GetText(6000)
+          if ($txtD -ne $null -and $txtD.Trim() -ne '' -and $joined.IndexOf($txtD.Trim()) -lt 0) {
+            $rD = $dD.Current.BoundingRectangle
+            $null = $nodes.Add([pscustomobject]@{ r = 'Document'; n = ''; v = ''; t = $txtD; p = $false; x = [int]$rD.X; y = [int]$rD.Y; w = [int]$rD.Width; h = [int]$rD.Height })
+            break
+          }
+        }
+      } catch {}
+    }
+  } catch {}
+}
 $sw.Stop()
 $out = [pscustomobject]@{ ok = $true; ms = [int]$sw.ElapsedMilliseconds; hwnd = $Hwnd; title = $el.Current.Name; cls = $el.Current.ClassName; n = $nodes.Count; nodes = $nodes; pwds = $pwds; edits = $pwdEdits }
 $json = $out | ConvertTo-Json -Compress -Depth 5

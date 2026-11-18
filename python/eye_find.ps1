@@ -36,12 +36,14 @@ try {
       $hit = $rest.FindText($Query, $false, $false)
       if ($hit -eq $null) { break }
       try {
+        $htxt = $Query
+        try { $gt = $hit.GetText(-1); if ($gt -ne $null -and $gt.Trim() -ne '') { $htxt = $gt.Trim() } } catch {}
         $rects = $hit.GetBoundingRectangles()
         if ($rects -ne $null) {
           foreach ($r in $rects) {
             $x = [int]$r.X; $y = [int]$r.Y; $w = [int]$r.Width; $h = [int]$r.Height
             if ($w -ge 2 -and $h -ge 2) {
-              $hits += [pscustomobject]@{ x = $x; y = $y; w = $w; h = $h; cx = [int]($x + $w / 2); cy = [int]($y + $h / 2); text = $Query }
+              $hits += [pscustomobject]@{ x = $x; y = $y; w = $w; h = $h; cx = [int]($x + $w / 2); cy = [int]($y + $h / 2); text = $htxt }
               if ($hits.Count -ge $MaxResults) { break }
             }
           }

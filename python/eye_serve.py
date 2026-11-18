@@ -954,6 +954,16 @@ def snapshot():
     with lock:
         return list(ring)
 
+def wait_ring(timeout=1.6):
+    """换屏 / 换区域 / 刚启动时近层会清空：显示类接口等一小会儿，别立刻回 no frames。"""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        items = snapshot()
+        if items:
+            return items
+        time.sleep(0.05)
+    return []
+
 def slow_loop():
     """远期层：每秒存一张缩小的画面。变了才存，没变就压到 10 秒一张。"""
     last_g = None; last_ts = 0.0
@@ -984,7 +994,7 @@ def slow_loop():
             slow_add((ts, jb))             # 原帧直接进远层，不再编码
 
 def window(span=10.0, n=100):
-    items = snapshot()
+    items = snapshot() or wait_ring()
     if not items: return []
     rec = items[-1][0] - items[0][0] if len(items) > 1 else 0.0
     if span > rec * 1.25 and slow:
@@ -1294,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
                         "hint": "0 = 所有屏拼起来，1..n = 第 n 块屏（按左上角坐标排序）；换屏后近层会清空重新抓"}); return
         if u.path == "/monitor":
             if "i" in q:
-                v = _clamp(q.get("i"), 0, 16)
+                v = _clamp(q.get("i"), 0, len(monitor_list()))   # 0=拼起来，1..n=第 n 块屏；越界不写脏值
                 if v is not None:
                     MON["i"] = int(v)
                 with lock:
@@ -1492,7 +1502,7 @@ class Handler(BaseHTTPRequestHandler):
             d = diffs(win)
             self._json({"n": len(win), "diffs": d, "hot_cells": [i for i, v in enumerate(d) if v >= 1.0][:60]}); return
         if u.path in ("/cell", "/fovea", "/fovea_at_cursor"):
-            items = snapshot()
+            items = snapshot() or wait_ring()
             if not items: self._json({"error": "no frames"}); return
             if u.path == "/cell" and "i" in q:
                 win = window(f("span", 10.0), i_("n", 100))
@@ -1514,7 +1524,7 @@ class Handler(BaseHTTPRequestHandler):
                 im = im.crop((x0, y0, x0 + fw, y0 + fh))
             self._img(im); return
         if u.path in ("/live", "/peek"):
-            items = snapshot()
+            items = snapshot() or wait_ring()
             if not items: self._json({"error": "no frames"}); return
             try:
                 im = apply_mask(decode(items[-1][1]))
@@ -1528,7 +1538,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d); return
         if u.path == "/shot":
-            items = snapshot()
+            items = snapshot() or wait_ring()
             if not items: self._json({"error": "no frames"}); return
             target = items[-1][0] - f("t", 0)
             best = min(items, key=lambda x: abs(x[0] - target))
@@ -1545,13 +1555,13 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     hwnd = 0
             mx = max(5, min(400, i_("max", 120)))
-            tmode = (q.get("mode") or ["auto"])[0]
+            tmode = (q.get("mode") or "auto").strip().lower()
             d = {"ok": False, "err": "skipped"}
             if tmode != "ocr":
                 d = text_from_window(hwnd, mx)
             got = int(d.get("readable") or 0) if d.get("ok") else 0
             if tmode == "ocr" or (tmode == "auto" and got < 3):
-                items = snapshot()
+                items = snapshot() or wait_ring(0.8)
                 jb = items[-1][1] if items else None
                 if jb and all_mask_rects():
                     # OCR 走像素，也得先糊一遍再喂进去，否则打码对读字形同虚设
@@ -1568,7 +1578,7 @@ class Handler(BaseHTTPRequestHandler):
                     d["ocr"] = ocr
             self._json(d); return
         if u.path == "/find":
-            fq = (q.get("q") or [""])[0].strip()
+            fq = (q.get("q") or "").strip()
             if not fq:
                 self._json({"ok": False, "err": "need q"}); return
             hwnd = i_("hwnd", 0)
@@ -1611,7 +1621,7 @@ class Handler(BaseHTTPRequestHandler):
                 rd = range_hits(hwnd, fq, 12)
                 rh = rd.get("hits") or []
                 if rh:
-                    hits = [{"name": fq, "role": "文字", "src": "uia-range",
+                    hits = [{"name": (h.get("text") or fq), "role": "文字", "src": "uia-range",
                              "x": int(h["x"]), "y": int(h["y"]), "w": int(h["w"]), "h": int(h["h"]),
                              "cx": int(h["cx"]), "cy": int(h["cy"])} for h in rh]
                     src = "uia-range"
@@ -1619,7 +1629,7 @@ class Handler(BaseHTTPRequestHandler):
             ocr_note = ""
             if not hits:
                 # 无障碍树里找不到（Qt / 自绘界面 / 游戏）：退回本地 OCR，按屏幕文字找坐标。
-                items = snapshot()
+                items = snapshot() or wait_ring(0.8)
                 jb = items[-1][1] if items else None
                 if jb:
                     try:
