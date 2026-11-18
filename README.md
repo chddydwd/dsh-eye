@@ -25,35 +25,15 @@ AI 平时只看得见你主动给它的那一帧截图，看不见动作发生�
 
 ## 安装（Windows）
 
-1. **装 Python 依赖**
+前置：Python 3.10+、ffmpeg（`winget install Gyan.FFmpeg`）。
 
-   ```
-   pip install numpy pillow
-   ```
+```powershell
+git clone https://github.com/chddydwd/dsh-eye.git
+cd dsh-eye
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
 
-2. **准备 ffmpeg**：装到 PATH，或者把路径写进环境变量 `EYE_FFMPEG`；DSH 自带的 ffmpeg（`~/.dsh/.dsh-wallpaper-engine/ffmpeg/ffmpeg.exe`）会自动被找到。
-
-3. **放脚本**：把 `python/` 里的文件放到任意目录，例如 `D:\eye\`。
-
-4. **告诉插件脚本在哪**：编辑 `~/.dsh/eye.json`（没有就新建）：
-
-   ```json
-   {
-     "paths": {
-       "dir": "D:\\eye",
-       "python": "C:\\Python312\\python.exe"
-     },
-     "watch": true,
-     "mode": "toast",
-     "autostart": true
-   }
-   ```
-
-   `dir` 必填；`python` 可省（会自动找常见路径）。也可以用环境变量 `DSH_EYE_HOME` / `DSH_EYE_PYTHON` / `EYE_FFMPEG`。
-
-5. **装插件**：把本仓库放到某个目录，然后在 DSH profile 里链接它（`~/.dsh/profiles/<profile>/node_modules/dsh-eye` 指向仓库目录，并在该 profile 的 `package.json` 的依赖与 `bundles` 里加上 `dsh-eye`）。
-
-6. 重启 DSH，左侧栏出现「眼睛」，点开 → 面板上「打开」就开始采集。
+装完重启 DSH，左侧栏出现「眼睛」，点「打开」开始采集。脚本会把插件与采集脚本一起装进 `~\.dsh\plugins\dsh-eye`、写 `~\.dsh\eye.json`、挂进 profile 并检查 ffmpeg；不想跑脚本可以看 [INSTALL.md](INSTALL.md) 里的手动步骤。卸载用 `uninstall.ps1`。
 
 ## 工具
 
