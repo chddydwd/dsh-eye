@@ -80,7 +80,7 @@ try { $ver = & $Py -c "import sys;print('%d.%d' % sys.version_info[:2])" } catch
 Say "python version: $ver"
 
 if (-not $SkipDeps) {
-  Say "installing numpy + pillow (python -m pip install -r requirements.txt)"
+  Say "installing numpy + pillow + mss (python -m pip install -r requirements.txt)"
   & $Py -m pip install --disable-pip-version-check --quiet -r (Join-Path $PyDest 'requirements.txt')
   if ($LASTEXITCODE -ne 0) { Warn "pip install failed (exit $LASTEXITCODE). Eye will not capture until numpy/pillow are available." }
 }

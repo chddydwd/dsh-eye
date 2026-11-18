@@ -8,7 +8,6 @@ from PIL import Image, ImageDraw, ImageFont
 def _find_ff():
     """ffmpeg 位置：env EYE_FFMPEG → PATH → 常见安装位置 → 只写 ffmpeg 交给 PATH。"""
     cands = [os.environ.get("EYE_FFMPEG"), shutil.which("ffmpeg"),
-             os.path.join(os.path.expanduser("~"), ".dsh", ".dsh-wallpaper-engine", "ffmpeg", "ffmpeg.exe"),
              os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "ffmpeg", "bin", "ffmpeg.exe")]
     for c in cands:
         if c and os.path.isfile(c):
