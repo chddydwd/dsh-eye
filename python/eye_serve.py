@@ -130,7 +130,7 @@ def slow_add(item):
     slow.append(item)
     slow_bytes[0] += len(item[1])
     trim_slow()
-stats = {"fps": 0.0, "n": 0, "err": ""}
+stats = {"fps": 0.0, "n": 0, "err": "", "started": 0.0, "last_ok": 0.0}
 trail = collections.deque(maxlen=1200)      # (ts, x, y)
 clicks = collections.deque(maxlen=80)       # dict(ts,x,y,hwnd,title)
 last_btn = 0
@@ -298,6 +298,7 @@ def capture():
         stats["err"] = "mss-unavailable: " + repr(e)[:120]
         return capture_ffmpeg()
     fps = FPS_LO
+    stats["started"] = time.time()
     mode["fps"] = fps; stats["mode"] = fps
     cnt = 0; t0 = time.time()
     tsq = collections.deque()
@@ -340,6 +341,7 @@ def capture():
             ts = time.time()
             with lock:
                 ring.append((ts, b.getvalue())); stats["n"] = len(ring)
+            stats["last_ok"] = ts
         except Exception as e:
             stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
         if HOOK_Q:
@@ -447,6 +449,7 @@ def capture_ffmpeg():
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             with lock:
                 ring.append((ts, b.getvalue())); stats["n"] = len(ring)
+            stats["last_ok"] = ts
             _put_thumb(ts, im)
             cnt += 1
             if cnt % fps == 0:
@@ -1696,10 +1699,50 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "msg": m}); return
         self._json({"error": "unknown"})
 
+def _capture_supervisor():
+    """采集线程掉了就再起一个，别安静地没了。"""
+    while True:
+        try:
+            capture()
+        except Exception as e:
+            stats["err"] = "capture crashed: " + repr(e)[:160]
+            try:
+                sys.stdout.write("[eye] capture crashed: %r\n" % (e,)); sys.stdout.flush()
+            except Exception:
+                pass
+        stats["started"] = 0.0
+        time.sleep(1.0)
+
+
+def capture_watchdog():
+    """采集心跳：25 秒没新帧就当卡死，重启进程（HTTP 服务跟着重起），别让画面悄悄消失。"""
+    time.sleep(8.0)
+    while True:
+        time.sleep(5.0)
+        try:
+            if stats.get("paused"):
+                continue
+            t0 = float(stats.get("started") or 0)
+            if t0 <= 0:
+                continue
+            lo = max(float(stats.get("last_ok") or 0), t0)
+            gap = time.time() - lo
+            if gap > 25:
+                stats["err"] = "capture stalled %.0fs: restarting" % gap
+                try:
+                    sys.stdout.write("[eye] capture stalled %.0fs, restarting\n" % gap); sys.stdout.flush()
+                except Exception:
+                    pass
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     if HOOK["want"]:
         hooks_start()
-    threading.Thread(target=capture, daemon=True).start()
+    threading.Thread(target=_capture_supervisor, daemon=True).start()
+    threading.Thread(target=capture_watchdog, daemon=True).start()
     threading.Thread(target=pointer, daemon=True).start()
     threading.Thread(target=activity_loop, daemon=True).start()
     threading.Thread(target=slow_loop, daemon=True).start()
