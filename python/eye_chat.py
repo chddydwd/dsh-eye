@@ -9,6 +9,8 @@
 import ctypes
 import json
 import os
+import threading
+import time
 import urllib.request
 import tkinter as tk
 
@@ -143,6 +145,16 @@ class ChatWin:
         self.root.after(300, self.poll)
         self.root.after(400, self._focus_typing)
         self.root.after(600, self._assert_focus)
+        threading.Thread(target=self._beat, daemon=True).start()
+
+    def _beat(self):
+        """告诉眼睛服务「这个窗口还活着」：窗口不是插件自己起的，也能被认出来。"""
+        while True:
+            try:
+                api("/chat/win", {"hwnd": self._hwnd()}, timeout=2)
+            except Exception:
+                pass
+            time.sleep(15)
 
     def _hwnd(self):
         try:

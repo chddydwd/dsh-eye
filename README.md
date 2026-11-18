@@ -25,7 +25,7 @@ AI 平时只看得见你主动给它的那一帧截图，看不见动作发生�
 
 ## 安装（Windows）
 
-前置：Python 3.10+、ffmpeg（`winget install Gyan.FFmpeg`）。
+前置：Python 3.10+（安装脚本会 `pip install` 抓屏依赖 `mss`）。ffmpeg 是可选的兜底：装了更稳，没有也能跑（`winget install Gyan.FFmpeg`）。分辨率、ffmpeg 路径都自动探测，不用手改。
 
 ```powershell
 git clone https://github.com/chddydwd/dsh-eye.git
@@ -49,6 +49,15 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 面板上还能改采样参数（近层时长、帧率、闲时帧率、远层间隔与跨度、画质），改完立即生效，重启也记得。
 
+## 环境变量（可选，一般不用动）
+
+| 变量 | 作用 |
+| --- | --- |
+| `EYE_PORT` | 采集服务端口，默认 `13201` |
+| `EYE_RUNTIME` | 运行参数的 JSON 路径，默认 `~\.dsh\eye-runtime.json` |
+| `EYE_CAPTURE` | 设成 `ffmpeg` 就强制走 ffmpeg 抓屏（调试 / mss 出问题时用） |
+| `EYE_FFMPEG` | 指定 ffmpeg 可执行文件路径 |
+
 ## 开销（本机实测，1920×1080）
 
 - 闲着：约 0.07 核 CPU、120MB 内存（没人动时降到 2fps，画面本来也不变）。
@@ -64,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 ## 已知限制
 
-- Windows 单屏；多屏、DPI 缩放未适配。
+- Windows，只抓主屏（按主屏实际分辨率，DPI 缩放已处理）；多屏未支持。
 - 抓屏走系统级截屏（优先 mss，缺依赖时退回 ffmpeg gdigrab），被其他窗口挡住的区域看不到（抓的是屏幕像素，不是后台渲染）。
 - 「大变化」是启发式判断：换前台窗口算硬事件；视频在放、页面滚动这类持续变化不算。仍可能误报或漏报，阈值可调。
 - 灵敏度三档只是放宽/收紧判据（`quiet` ×1.6、`normal` ×1.0、`sensitive` ×0.6），不是保证：`sensitive` 会更灵但也更容易吵，`quiet` 更安静但会漏掉同窗口内的局部大改。

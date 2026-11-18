@@ -1,19 +1,42 @@
 
-import io, json, os, threading, time, subprocess, collections, ctypes
+import io, json, os, sys, shutil, threading, time, subprocess, collections, ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-FF = r"C:\Users\Ddy\.dsh\.dsh-wallpaper-engine\ffmpeg\ffmpeg.exe"
-W, H = 1920, 1080
+def _find_ff():
+    """ffmpeg 位置：env EYE_FFMPEG → PATH → 常见安装位置 → 只写 ffmpeg 交给 PATH。"""
+    cands = [os.environ.get("EYE_FFMPEG"), shutil.which("ffmpeg"),
+             os.path.join(os.path.expanduser("~"), ".dsh", ".dsh-wallpaper-engine", "ffmpeg", "ffmpeg.exe"),
+             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "ffmpeg", "bin", "ffmpeg.exe")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return "ffmpeg"
+
+def _screen_size():
+    """分辨率不写死：按当前主屏实际像素走（先用 mss 抓的是物理像素）。"""
+    try:
+        u = ctypes.windll.user32
+        u.SetProcessDPIAware()
+        w, h = int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
+        if w > 0 and h > 0:
+            return w, h
+    except Exception:
+        pass
+    return 1920, 1080
+
+FF = _find_ff()
+W, H = _screen_size()
+PORT = int(os.environ.get("EYE_PORT") or 13201)
 FPS_HI = 20          # 有人在动（鼠标/键盘最近 1.2 秒内有过）时的采样率
 FPS_LO = 2           # 屏幕闲着时的采样率：没人动的时候画面本来就不变，2fps 足够，CPU 再砍一半
 SPAN = 30.0          # 近期稠密层：20fps × 30 秒
 Q = 82
 SS = 2               # 4:2:0，编码快一倍、体积小一半；1:1 读字几乎无差
 IDLE_HOLD_MS = 600000  # 没人动超过 10 分钟就彻底停采集（CPU 归零），一动立刻醒
-CFG_PATH = r"C:\Users\Ddy\.dsh\eye-runtime.json"   # 面板改的参数存这儿，重启采集也记得
+CFG_PATH = os.environ.get("EYE_RUNTIME") or os.path.join(os.path.expanduser("~"), ".dsh", "eye-runtime.json")   # 面板改的参数存这儿，重启采集也记得
 DEFAULTS = {"near_fps": 20, "idle_fps": 2, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
 mode = {"fps": FPS_LO, "paused": False}
 ring = collections.deque(maxlen=int(FPS_HI * SPAN) + 5)
@@ -53,6 +76,7 @@ def _put_thumb(ts, im):
 CHAT = collections.deque(maxlen=400)
 CHAT_ID = [0]
 chat_lock = threading.Lock()
+WIN = {"hwnd": 0, "at": 0.0}   # 小窗心跳：窗口由插件起还是外面起，都能认出来
 
 def chat_add(frm, text, kind="chat"):
     with chat_lock:
@@ -126,6 +150,9 @@ def capture():
 
     mss 不可用时退回 ffmpeg（capture_ffmpeg），行为一样。
     """
+    if (os.environ.get("EYE_CAPTURE") or "").strip().lower() == "ffmpeg":
+        stats["err"] = "forced-ffmpeg"
+        return capture_ffmpeg()
     try:
         import mss
         s = mss.MSS()
@@ -619,6 +646,9 @@ class Handler(BaseHTTPRequestHandler):
             a["ago"] = round(time.time() - a["at"], 2) if a["at"] else None
             a["frames"] = len(snapshot())
             self._json(a); return
+        if u.path == "/chat/win":
+            self._json({"hwnd": WIN["hwnd"], "at": round(WIN["at"], 2),
+                        "alive": bool(WIN["at"] and time.time() - WIN["at"] < 30)}); return
         if u.path == "/chat":
             since = i_("since", 0)
             with chat_lock:
@@ -640,6 +670,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             n = 0
         raw = self.rfile.read(n) if n > 0 else b""
+        if u.path == "/chat/win":
+            try:
+                j = json.loads(raw.decode() or "{}")
+            except Exception:
+                j = {}
+            WIN["hwnd"] = int(j.get("hwnd") or 0)
+            WIN["at"] = time.time()
+            self._json({"ok": True}); return
         if u.path == "/chat":
             try:
                 j = json.loads(raw.decode() or "{}")
@@ -660,4 +698,5 @@ if __name__ == "__main__":
     threading.Thread(target=activity_loop, daemon=True).start()
     threading.Thread(target=slow_loop, daemon=True).start()
     time.sleep(1.5)
-    ThreadingHTTPServer(("127.0.0.1", 13201), Handler).serve_forever()
+    print("eye_serve listening on %d, capture=%s" % (PORT, "mss" if not (os.environ.get("EYE_CAPTURE") or "").strip() else os.environ.get("EYE_CAPTURE")), flush=True)
+    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
