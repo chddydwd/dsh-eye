@@ -320,11 +320,6 @@ class ChatWin:
         # 点窗口任何地方都把光标放回输入框（普通窗口的键盘焦点由系统给，这里只管输入框）
         self.root.bind_all("<Button-1>", self._focus_typing, add="+")
         self.root.bind("<FocusIn>", lambda e: self.entry.focus_force())
-        # 调试：把键盘/焦点事件写文件，确认按键到底进没进来
-        self._dbg = os.path.join(os.path.expanduser("~"), ".dsh", "eye-chat-keys.log")
-        self.root.bind_all("<Key>", self._log_key, add="+")
-        self.root.bind_all("<FocusIn>", self._log_focus, add="+")
-
         self.say_line("dim", "这里直接跟我说话，回车发出。我可以拉大小、拖着放哪都行。")
         try:
             with open(os.path.join(os.path.expanduser("~"), ".dsh", "eye-chat-hwnd.txt"), "w") as f:
@@ -355,24 +350,6 @@ class ChatWin:
             return int(root or child)
         except Exception:
             return int(self.root.winfo_id())
-
-    def _log(self, line):
-        try:
-            with open(self._dbg, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-    def _log_key(self, e):
-        self._log("KEY %s widget=%s focus=%s" % (e.keysym, e.widget, self.root.focus_get()))
-
-    def _log_focus(self, e):
-        self._log("FOCUS widget=%s focus=%s" % (e.widget, self.root.focus_get()))
-        try:
-            self.entry.focus_force()
-            self._log("  -> focus now %s" % self.root.focus_get())
-        except Exception as ex:
-            self._log("  -> focus err %s" % ex)
 
     def _dark_title(self):
         """标题栏染成深色，跟窗口一套衣服。"""
