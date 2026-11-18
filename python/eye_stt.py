@@ -28,6 +28,9 @@ def to_simplified(s):
 
 
 _PROMPT = "以下是普通话的句子，用简体中文。"
+# 给界面上的术语一点偏好，短句不容易听成谐音（faster-whisper 的 hotwords）。
+_HOTWORDS = ("鼠标 钩子 隐私打码 敏感窗口 自动挡 跟随 整屏 框一块 灵敏度 面板 眼睛 采集 帧率 "
+             "快捷键 对话框 语音 简体 开启 关闭 设置 修复")
 
 
 def _norm(s):
@@ -122,7 +125,8 @@ def transcribe_pcm(pcm, rate=16000, language="zh"):
     audio = np.frombuffer(pcm, dtype=np.int16).astype("float32") / 32768.0
     segs, info = m.transcribe(audio, language=language, beam_size=1, vad_filter=True,
                               condition_on_previous_text=False,
-                              initial_prompt=_PROMPT if language == "zh" else None)
+                              initial_prompt=_PROMPT if language == "zh" else None,
+                              hotwords=_HOTWORDS if language == "zh" else None)
     txt = to_simplified("".join(s.text for s in segs).strip())
     return "" if _prompt_echo(txt) else txt
 
@@ -140,6 +144,7 @@ def transcribe_file(path, language="zh"):
     m = load()
     segs, info = m.transcribe(p, language=language, beam_size=1, vad_filter=True,
                               condition_on_previous_text=False,
-                              initial_prompt=_PROMPT if language == "zh" else None)
+                              initial_prompt=_PROMPT if language == "zh" else None,
+                              hotwords=_HOTWORDS if language == "zh" else None)
     txt = to_simplified("".join(s.text for s in segs).strip())
     return "" if _prompt_echo(txt) else txt
