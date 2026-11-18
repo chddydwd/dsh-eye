@@ -19,6 +19,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# PS5 的 Set-Content -Encoding UTF8 会写 BOM；DSH 启动时 JSON.parse 遇到 BOM 会直接崩，所以自己写
+function WriteUtf8NoBom($Path, $Text) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $Text, $enc)
+}
+
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME '.dsh' }
 $Dest = Join-Path $DshHome 'plugins\dsh-eye'
@@ -96,7 +103,7 @@ if (-not $cfg.Contains('maxPerHour')) { $cfg['maxPerHour'] = 12 }
 if (-not $cfg.Contains('autostart')) { $cfg['autostart'] = $true }
 $paths = [ordered]@{ dir = $PyDest; python = $Py }
 $cfg['paths'] = $paths
-($cfg | ConvertTo-Json -Depth 20) | Set-Content -Encoding UTF8 -Path $EyeJson
+WriteUtf8NoBom -Path $EyeJson -Text ($cfg | ConvertTo-Json -Depth 20)
 Say "wrote $EyeJson (paths.dir = $PyDest)"
 
 # ---------- 4. profiles ----------
@@ -140,7 +147,7 @@ foreach ($prof in $targets) {
     $pkg.dsh.profile.bundles = @($bundles + 'dsh-eye')
     Say "registered bundle dsh-eye in $prof"
   }
-  ($pkg | ConvertTo-Json -Depth 100) | Set-Content -Encoding UTF8 -Path $pkgPath
+  WriteUtf8NoBom -Path $pkgPath -Text ($pkg | ConvertTo-Json -Depth 100)
 
   $nm = Join-Path $prof 'node_modules'
   New-Item -ItemType Directory -Force -Path $nm | Out-Null

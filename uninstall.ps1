@@ -16,6 +16,12 @@ $EyeJson = Join-Path $DshHome 'eye.json'
 
 function Say($m) { Write-Host "[dsh-eye] $m" }
 
+# PS5 的 Set-Content -Encoding UTF8 会写 BOM；DSH 启动时 JSON.parse 遇到 BOM 会直接崩，所以自己写
+function WriteUtf8NoBom($Path, $Text) {
+  $enc = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($Path, $Text, $enc)
+}
+
 $profilesRoot = Join-Path $DshHome 'profiles'
 if (Test-Path $profilesRoot) {
   Get-ChildItem -Path $profilesRoot -Directory | ForEach-Object {
@@ -34,7 +40,7 @@ if (Test-Path $profilesRoot) {
       }
       if ($changed) {
         Copy-Item -Force $pkgPath "$pkgPath.dsh-eye-uninstall.bak"
-        ($pkg | ConvertTo-Json -Depth 100) | Set-Content -Encoding UTF8 -Path $pkgPath
+        WriteUtf8NoBom -Path $pkgPath -Text ($pkg | ConvertTo-Json -Depth 100)
         Say "cleaned profile $prof"
       }
     }
