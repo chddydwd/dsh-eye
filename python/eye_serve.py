@@ -651,6 +651,20 @@ class Handler(BaseHTTPRequestHandler):
                 x0 = max(0, min(W - fw, cx - fw // 2)); y0 = max(0, min(H - fh, cy - fh // 2))
                 im = im.crop((x0, y0, x0 + fw, y0 + fh))
             self._img(im); return
+        if u.path in ("/live", "/peek"):
+            items = snapshot()
+            if not items: self._json({"error": "no frames"}); return
+            try:
+                im = decode(items[-1][1])
+            except Exception:
+                self._json({"error": "decode"}); return
+            tw = max(80, min(1280, i_("w", 480)))
+            if im.size[0] > tw:
+                im = im.resize((tw, max(1, int(im.size[1] * tw / im.size[0]))), Image.BILINEAR)
+            b = io.BytesIO(); im.save(b, "JPEG", quality=max(30, min(95, i_("q", 65)))); d = b.getvalue()
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self._cors()
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d); return
         if u.path == "/shot":
             items = snapshot()
             if not items: self._json({"error": "no frames"}); return
