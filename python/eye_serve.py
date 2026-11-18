@@ -41,6 +41,28 @@ DEFAULTS = {"near_fps": 20, "idle_fps": 5, "near_span": 30.0, "far_step": 2.0, "
 # 求稳优先——下限 5fps，慢推镜/缓慢滚动也掉不下来；真静止才落到下限。
 MOVE_DIFF = 5.0        # 0.6 秒间隔的平均差 ≥ 这个值 → 判「在动」，直接拉满（拖窗口实测 20~47）
 SLOW_DIFF = 3.0        # ≥ 这个值 → 判「在慢慢动」，取中间档（动态壁纸实测 1~1.5，留余量当静止）
+# 自动性能档：不看用户配置，按实测单帧耗时自己落档（慢机器不用懂参数）。
+# 25fps 一帧的预算是 40ms；连续平均超 45ms 就退一档，余量够（平均 <26ms）且撑住 20 秒才升回去。
+AUTO = {"on": True, "cap": FPS_HI, "avg_ms": 0.0, "last_check": 0.0, "up_since": 0.0, "note": "自动"}
+AUTO_DOWN_MS = float(os.environ.get("EYE_AUTO_DOWN_MS") or 45.0)
+AUTO_UP_MS = float(os.environ.get("EYE_AUTO_UP_MS") or 26.0)
+AUTO_UP_HOLD = 20.0
+
+def auto_tiers():
+    ts = {FPS_HI, 20, 16, 12, 8}
+    ts = sorted(t for t in ts if 5 <= t <= FPS_HI)
+    return ts or [FPS_HI]
+
+def auto_step(down):
+    ts = auto_tiers()
+    cur = min(ts, key=lambda t: abs(t - AUTO["cap"]))
+    i = ts.index(cur)
+    if down and i > 0:
+        return ts[i - 1]
+    if (not down) and i < len(ts) - 1:
+        return ts[i + 1]
+    return cur
+
 mode = {"fps": FPS_LO, "paused": False}
 ring = collections.deque(maxlen=int(FPS_HI * SPAN) + 5)
 SLOW_STEP = 2.0        # 远期层：每 2 秒一张，全是原分辨率原画质，字照样清
@@ -94,7 +116,7 @@ def _put_thumb(ts, im):
     return t
 # 对话框：不经过 QQ，跟鲸鲸实时说话（看视频/一起玩的时候用）。只放内存，不落盘。
 CHAT = collections.deque(maxlen=400)
-CHAT_ID = [0]
+CHAT_ID = [int(time.time() * 1000)]   # 毫秒时间戳起跳：服务重启后编号不回 1（否则小窗的 since 会把新消息全滤掉）
 chat_lock = threading.Lock()
 WIN = {"hwnd": 0, "at": 0.0}   # 小窗心跳：窗口由插件起还是外面起，都能认出来
 # 鼠标钩子（实验，默认关）：用系统事件通知，代替「每 20ms 问一次按键」。回调跑在系统输入线程里，
@@ -222,6 +244,7 @@ def capture():
     tsq = collections.deque()
     prev_thumb = [None]
     mid_fps = max(FPS_LO + 1, min(FPS_HI, (FPS_HI + FPS_LO) // 2))
+    ams = collections.deque(maxlen=24)   # 最近若干帧的实际耗时，给自动性能档用
     while True:
         # 久无人动就停采集：只剩 1 秒一次的 idle 查询，CPU 基本归零
         while True:
@@ -236,12 +259,13 @@ def capture():
         stats["paused"] = False
         d = stats.get("diff")
         now = time.time()
+        cap = AUTO["cap"] if AUTO["on"] else FPS_HI   # 自动档只封顶，不改变「什么时候该快」的判据
         if 0 <= idle_ms() < 1200 or (d is not None and d >= MOVE_DIFF):
-            want = FPS_HI; ADAPT["last_move"] = now
+            want = min(FPS_HI, cap); ADAPT["last_move"] = now
         elif d is not None and d >= SLOW_DIFF:
-            want = mid_fps; ADAPT["last_move"] = now
+            want = min(mid_fps, cap); ADAPT["last_move"] = now
         elif now - ADAPT["last_move"] < ADAPT["hold"]:
-            want = fps            # 刚动过：保持当前档，别在 5/12/20 之间来回抖
+            want = min(fps, cap) if AUTO["on"] else fps   # 刚动过：保持当前档，别在 5/12/20 之间来回抖
         else:
             want = FPS_LO
         stats["want"] = want
@@ -279,6 +303,32 @@ def capture():
             stats["fps"] = round((len(tsq) - 1) / max(1e-6, tsq[-1] - tsq[0]), 1)
         dt = time.time() - t_start
         stats["ms"] = round(dt * 1000, 1)
+        # 自动性能档：看最近这一段的真实耗时，吃力就退、缓过来再升（带迟滞，不来回抖）
+        if AUTO["on"]:
+            ams.append(dt * 1000.0)
+            nm = time.time()
+            if len(ams) >= 10 and nm - AUTO["last_check"] >= 2.0:
+                avg = sum(ams) / len(ams)
+                AUTO["avg_ms"] = round(avg, 1)
+                AUTO["last_check"] = nm
+                cur = min(auto_tiers(), key=lambda t: abs(t - AUTO["cap"]))
+                if avg > AUTO_DOWN_MS:
+                    nxt = auto_step(True)
+                    if nxt < cur:
+                        AUTO["cap"] = nxt
+                        AUTO["note"] = "单帧 %.0fms 超预算，退到 %dfps" % (avg, nxt)
+                    AUTO["up_since"] = 0.0
+                elif avg < AUTO_UP_MS:
+                    if not AUTO["up_since"]:
+                        AUTO["up_since"] = nm
+                    elif nm - AUTO["up_since"] >= AUTO_UP_HOLD:
+                        nxt = auto_step(False)
+                        if nxt > cur:
+                            AUTO["cap"] = nxt
+                            AUTO["note"] = "余量够了，升回 %dfps" % nxt
+                        AUTO["up_since"] = 0.0
+                else:
+                    AUTO["up_since"] = 0.0
         gap = 1.0 / fps - dt
         if HOOK["on"] and time.time() - HOOK["burst"] < 0.35:
             gap = 0.0        # 刚点了鼠标：下一帧立刻抓，别等 idle 那 200ms
@@ -472,6 +522,17 @@ def _load_region():
         pass
 _load_region()
 
+def _load_auto():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            v = (json.load(f) or {}).get("auto")
+        if isinstance(v, bool):
+            AUTO["on"] = v
+    except Exception:
+        pass
+_load_auto()
+AUTO["cap"] = FPS_HI   # 跟着当前性能档起跳
+
 def region_box():
     """有效框选区域（mss 用的 dict）；全屏时返回 None。"""
     if REGION["w"] >= 60 and REGION["h"] >= 60:
@@ -486,6 +547,7 @@ def frame_size():
 def save_cfg():
     try:
         payload = dict(CFG); payload["region"] = dict(REGION); payload["hooks"] = bool(HOOK["want"])
+        payload["auto"] = bool(AUTO["on"])
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -535,6 +597,8 @@ def apply_cfg(q):
         slow = collections.deque(list(slow)[-SLOW_MAX:])
         slow_bytes[0] = sum(len(j) for _, j in slow)
         trim_slow()
+    AUTO["cap"] = FPS_HI; AUTO["avg_ms"] = 0.0; AUTO["up_since"] = 0.0
+    AUTO["note"] = "自动" if AUTO["on"] else "关（按你设的档跑）"
     save_cfg()
     return cfg_state()
 
@@ -753,8 +817,18 @@ class Handler(BaseHTTPRequestHandler):
                         "hooks": {"want": bool(HOOK["want"]), "on": bool(HOOK["on"]), "ok": bool(HOOK["ok"]),
                                   "events": HOOK["events"], "err": HOOK["err"],
                                   "last_event_ago": round(time.time() - HOOK["at"], 2) if HOOK["at"] else None},
+                        "auto": {"on": bool(AUTO["on"]), "cap": AUTO["cap"], "avg_ms": AUTO["avg_ms"], "note": AUTO["note"]},
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
+        if u.path == "/auto":
+            if "on" in q:
+                v = str(q.get("on")).strip().lower() in ("1", "true", "on", "yes")
+                AUTO["on"] = v
+                AUTO["cap"] = FPS_HI; AUTO["up_since"] = 0.0; AUTO["avg_ms"] = 0.0
+                AUTO["note"] = "自动" if v else "关（按你设的档跑）"
+                save_cfg()
+            self._json({"on": bool(AUTO["on"]), "cap": AUTO["cap"], "avg_ms": AUTO["avg_ms"], "note": AUTO["note"],
+                        "hint": "开着时按实测单帧耗时自己落档/升回，用户不用懂参数；关掉就完全按面板设的帧率跑"}); return
         if u.path == "/hooks":
             if "on" in q:
                 v = str(q.get("on")).strip().lower() in ("1", "true", "on", "yes")

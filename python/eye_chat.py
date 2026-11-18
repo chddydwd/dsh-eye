@@ -302,6 +302,9 @@ class ChatWin:
             self.set_alive(False)
         else:
             self.set_alive(True)
+            srv_last = int(r.get("last") or 0)
+            if srv_last < self.last:   # 眼睛重启过、编号变了：清掉旧水位重收
+                self.last = 0
             for m in r.get("msgs") or []:
                 mid = int(m.get("id") or 0)
                 if mid <= self.last:
