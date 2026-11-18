@@ -1,45 +1,20 @@
 
-import io, json, os, shutil, threading, time, subprocess, collections, ctypes
+import io, json, os, threading, time, subprocess, collections, ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-def _find_ff():
-    """找 ffmpeg：环境变量 → PATH → DSH 自带的那份 → 裸名交给 PATH。"""
-    cand = [os.environ.get("EYE_FFMPEG"), os.environ.get("DSH_EYE_FFMPEG")]
-    w = shutil.which("ffmpeg")
-    if w:
-        cand.append(w)
-    cand.append(os.path.join(os.path.expanduser("~"), ".dsh", ".dsh-wallpaper-engine", "ffmpeg", "ffmpeg.exe"))
-    cand.append(r"C:\ffmpeg\bin\ffmpeg.exe")
-    for c in cand:
-        if c and os.path.isfile(c):
-            return c
-    return "ffmpeg"
-
-FF = _find_ff()
-
-def _screen_size():
-    try:
-        u = ctypes.windll.user32
-        u.SetProcessDPIAware()
-        w, h = u.GetSystemMetrics(0), u.GetSystemMetrics(1)
-        if w > 0 and h > 0:
-            return w, h
-    except Exception:
-        pass
-    return 1920, 1080
-
-W, H = _screen_size()
+FF = r"C:\Users\Ddy\.dsh\.dsh-wallpaper-engine\ffmpeg\ffmpeg.exe"
+W, H = 1920, 1080
 FPS_HI = 20          # 有人在动（鼠标/键盘最近 1.2 秒内有过）时的采样率
-FPS_LO = 4           # 屏幕闲着时的采样率，CPU 直接砍到五分之一
+FPS_LO = 2           # 屏幕闲着时的采样率：没人动的时候画面本来就不变，2fps 足够，CPU 再砍一半
 SPAN = 30.0          # 近期稠密层：20fps × 30 秒
 Q = 82
 SS = 2               # 4:2:0，编码快一倍、体积小一半；1:1 读字几乎无差
 IDLE_HOLD_MS = 600000  # 没人动超过 10 分钟就彻底停采集（CPU 归零），一动立刻醒
-CFG_PATH = os.environ.get("EYE_RUNTIME") or os.path.join(os.path.expanduser("~"), ".dsh", "eye-runtime.json")   # 面板改的参数存这儿，重启采集也记得
-DEFAULTS = {"near_fps": 20, "idle_fps": 4, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
+CFG_PATH = r"C:\Users\Ddy\.dsh\eye-runtime.json"   # 面板改的参数存这儿，重启采集也记得
+DEFAULTS = {"near_fps": 20, "idle_fps": 2, "near_span": 30.0, "far_step": 2.0, "far_sec": 3600, "quality": 82}
 mode = {"fps": FPS_LO, "paused": False}
 ring = collections.deque(maxlen=int(FPS_HI * SPAN) + 5)
 SLOW_STEP = 2.0        # 远期层：每 2 秒一张，全是原分辨率原画质，字照样清
@@ -52,18 +27,37 @@ stats = {"fps": 0.0, "n": 0, "err": ""}
 trail = collections.deque(maxlen=1200)      # (ts, x, y)
 clicks = collections.deque(maxlen=80)       # dict(ts,x,y,hwnd,title)
 last_btn = 0
-act = {"score": 0.0, "box": None, "at": 0.0, "idle_ms": 0, "title": ""}   # 最近一次活动检测（供插件主动叫醒）
+act = {"score": 0.0, "box": None, "at": 0.0, "idle_ms": 0, "title": "", "fg": None, "fg_at": 0.0, "fg_changed": False}   # 最近一次活动检测（供插件主动叫醒）
+FG_LAST = {"hwnd": 0, "at": 0.0}
 ACT_TICK = 0.5        # 每 0.5 秒量一次
 ACT_SCALE = (160, 90) # 缩到这个尺寸比，便宜且对整屏变化敏感
+THUMBS = collections.OrderedDict()   # ts -> int16 缩小灰度图（活动检测用，别每次解码整张 JPEG）
+th_lock = threading.Lock()
+TH_KEEP = 90          # 只留最近 90 帧的缩略（20fps 下约 4.5 秒，够 2.6 秒回看）
+
+def _thumb(im):
+    try:
+        return np.asarray(im.resize(ACT_SCALE).convert("L"), dtype=np.int16)
+    except Exception:
+        return None
+
+def _put_thumb(ts, im):
+    t = _thumb(im)
+    if t is None:
+        return
+    with th_lock:
+        THUMBS[ts] = t
+        while len(THUMBS) > TH_KEEP:
+            THUMBS.popitem(last=False)
 # 对话框：不经过 QQ，跟鲸鲸实时说话（看视频/一起玩的时候用）。只放内存，不落盘。
 CHAT = collections.deque(maxlen=400)
 CHAT_ID = [0]
 chat_lock = threading.Lock()
 
-def chat_add(frm, text):
+def chat_add(frm, text, kind="chat"):
     with chat_lock:
         CHAT_ID[0] += 1
-        m = {"id": CHAT_ID[0], "ts": round(time.time(), 2), "from": frm, "text": str(text)[:4000]}
+        m = {"id": CHAT_ID[0], "ts": round(time.time(), 2), "from": frm, "text": str(text)[:4000], "kind": kind}
         CHAT.append(m)
         return m
 try:
@@ -95,6 +89,21 @@ def fg_title():
     except Exception:
         return ""
 
+def fg_probe():
+    """前台窗口（hwnd, 标题），并标记「这一拍刚换过前台窗口」——窗口切换是硬事件，屏幕画面变化是软信号。"""
+    try:
+        h = user32.GetForegroundWindow()
+        t = win_title(h) if h else ""
+        now = time.time()
+        changed = bool(h) and h != FG_LAST["hwnd"]
+        if changed:
+            FG_LAST["hwnd"] = h
+            FG_LAST["at"] = now
+        return {"hwnd": int(h or 0), "title": t, "at": round(now, 3),
+                "changed": changed, "since": round(now - FG_LAST["at"], 2)}
+    except Exception:
+        return None
+
 def get_cursor():
     p = POINT(); user32.GetCursorPos(ctypes.byref(p)); return p.x, p.y
 
@@ -113,11 +122,57 @@ def _popen(fps):
     return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=W * H * 3 * 2)
 
 def capture():
-    """按人有没有在动手自动切采样率：动的时候 20fps，闲着 4fps。
+    """首选 mss 直接抓帧：比 ffmpeg gdigrab 便宜一半左右，切采样率也不用重启进程。
 
-    切档要重开 ffmpeg（输入端的 -framerate 定死），所以限最少 4 秒切一次，
-    免得手一抖就反复重启。环是按时间算的，切档不丢「最近 15 秒」的含义。
+    mss 不可用时退回 ffmpeg（capture_ffmpeg），行为一样。
     """
+    try:
+        import mss
+        s = mss.MSS()
+        mon = s.monitors[1]
+    except Exception as e:
+        stats["err"] = "mss-unavailable: " + repr(e)[:120]
+        return capture_ffmpeg()
+    fps = FPS_LO
+    mode["fps"] = fps; stats["mode"] = fps
+    cnt = 0; t0 = time.time()
+    while True:
+        # 久无人动就停采集：只剩 1 秒一次的 idle 查询，CPU 基本归零
+        while True:
+            v = idle_ms()
+            if v < 0 or v < IDLE_HOLD_MS:
+                break
+            mode["paused"] = True
+            stats["paused"] = True
+            stats["fps"] = 0.0
+            time.sleep(1.0)
+        mode["paused"] = False
+        stats["paused"] = False
+        want = FPS_HI if (0 <= idle_ms() < 1200) else FPS_LO
+        if want != fps:
+            fps = want; mode["fps"] = fps; stats["mode"] = fps
+        t_start = time.time()
+        try:
+            raw = s.grab(mon)
+            im = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+            b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
+            ts = time.time()
+            with lock:
+                ring.append((ts, b.getvalue())); stats["n"] = len(ring)
+            _put_thumb(ts, im)
+        except Exception as e:
+            stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
+        cnt += 1
+        if cnt % 20 == 0:
+            stats["fps"] = round(cnt / max(1e-6, time.time() - t0), 1)
+        dt = time.time() - t_start
+        stats["ms"] = round(dt * 1000, 1)
+        gap = 1.0 / fps - dt
+        if gap > 0:
+            time.sleep(gap)
+
+def capture_ffmpeg():
+    """兜底：ffmpeg gdigrab 抓帧（mss 装不上时用）。切档要重开进程，所以最少 4 秒切一次。"""
     n = W * H * 3
     fps = FPS_LO
     while True:
@@ -148,6 +203,7 @@ def capture():
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             with lock:
                 ring.append((ts, b.getvalue())); stats["n"] = len(ring)
+            _put_thumb(ts, im)
             cnt += 1
             if cnt % fps == 0:
                 stats["fps"] = round(cnt / (time.time() - t0), 1)
@@ -369,21 +425,40 @@ def activity_loop():
         ts, jpeg = items[-1]
         if time.time() - ts > 1.5:
             # 采集停着（休眠或异常），环里是旧帧：别拿旧帧算「刚刚变了」
+            fgi = fg_probe()
             act.update({"score": 0.0, "box": None, "at": round(ts, 3),
-                        "idle_ms": idle_ms(), "title": fg_title()})
+                        "idle_ms": idle_ms(), "title": fg_title(),
+                        "fg": fgi, "fg_at": fgi["at"] if fgi else 0.0,
+                        "fg_changed": bool(fgi and fgi["changed"])})
             continue
-        try:
-            a = _gray(jpeg)
-        except Exception:
-            continue
+        with th_lock:
+            ths = list(THUMBS.items())
+        a = ths[-1][1] if ths and ths[-1][0] == ts else None
+        if a is None:
+            try:
+                a = _gray(jpeg)
+            except Exception:
+                continue
         olds = []
         for off in ACT_LOOKBACK:
             ref = None
-            for t, j in items:
-                if t <= ts - off:
-                    ref = j
-                else:
-                    break
+            if ths:
+                for t, arr in ths:
+                    if t <= ts - off:
+                        ref = arr
+                    else:
+                        break
+            if ref is None:
+                for t, j in items:
+                    if t <= ts - off:
+                        ref = j
+                    else:
+                        break
+                if ref is not None:
+                    try:
+                        ref = _gray(ref)
+                    except Exception:
+                        ref = None
             if ref is not None:
                 olds.append(ref)
         if not olds:
@@ -406,8 +481,11 @@ def activity_loop():
                 sw, sh = W / ACT_SCALE[0], H / ACT_SCALE[1]
                 best_box = [int(xs.min() * sw), int(ys.min() * sh),
                             int((xs.max() - xs.min() + 1) * sw), int((ys.max() - ys.min() + 1) * sh)]
+        fgi = fg_probe()
         act.update({"score": round(best, 2), "box": best_box, "at": round(ts, 3),
-                    "idle_ms": idle_ms(), "title": fg_title()})
+                    "idle_ms": idle_ms(), "title": fg_title(),
+                    "fg": fgi, "fg_at": fgi["at"] if fgi else 0.0,
+                    "fg_changed": bool(fgi and fgi["changed"])})
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -441,7 +519,7 @@ class Handler(BaseHTTPRequestHandler):
             items = snapshot()
             span = (items[-1][0] - items[0][0]) if len(items) > 1 else 0
             x, y = get_cursor()
-            self._json({"frames": len(items), "fps": stats["fps"], "span_sec": round(span, 2),
+            self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
                         "size": [W, H], "cursor": [x, y], "clicks": len(clicks),
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
                         "err": stats["err"], "paused": bool(mode.get("paused")),
@@ -571,7 +649,8 @@ class Handler(BaseHTTPRequestHandler):
             frm = "me" if j.get("from") == "me" else "user"
             if not text:
                 self._json({"ok": False, "error": "empty"}); return
-            m = chat_add(frm, text)
+            kind = "status" if j.get("kind") == "status" else "chat"
+            m = chat_add(frm, text, kind)
             self._json({"ok": True, "msg": m}); return
         self._json({"error": "unknown"})
 
