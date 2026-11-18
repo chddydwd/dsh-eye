@@ -44,8 +44,23 @@ SLOW_STEP = 2.0        # 远期层：每 2 秒一张，全是原分辨率原画�
 SLOW_SIZE = None       # None = 不缩放，直接存原帧（还省一次重编码）
 SLOW_Q = 68
 SLOW_MAX = 1800        # 1800 张 × 2 秒 = 一小时
-slow = collections.deque(maxlen=SLOW_MAX)
+FAR_BUDGET = int(float(os.environ.get("EYE_FAR_MB") or 320) * 1024 * 1024)   # 远层总字节上限（默认 320MB，EYE_FAR_MB 可改）
+slow = collections.deque()      # 不设 maxlen：张数 + 字节双预算手动裁
+slow_bytes = [0]
 lock = threading.Lock()
+
+def trim_slow():
+    """远层双重预算：最多 SLOW_MAX 张，且总字节不超过 FAR_BUDGET——新的留，旧的丢。"""
+    while slow and (len(slow) > SLOW_MAX or (slow_bytes[0] > FAR_BUDGET and len(slow) > 1)):
+        _, jb_old = slow.popleft()
+        slow_bytes[0] -= len(jb_old)
+    if slow_bytes[0] < 0:
+        slow_bytes[0] = 0
+
+def slow_add(item):
+    slow.append(item)
+    slow_bytes[0] += len(item[1])
+    trim_slow()
 stats = {"fps": 0.0, "n": 0, "err": ""}
 trail = collections.deque(maxlen=1200)      # (ts, x, y)
 clicks = collections.deque(maxlen=80)       # dict(ts,x,y,hwnd,title)
@@ -307,8 +322,9 @@ def cfg_state():
     near = int(FPS_HI * SPAN) + 5
     return {"near_fps": FPS_HI, "idle_fps": FPS_LO, "near_span": SPAN,
             "far_step": SLOW_STEP, "far_sec": round(SLOW_STEP * SLOW_MAX, 1), "quality": Q,
-            "near_frames": near, "far_frames": SLOW_MAX,
-            "est_mem_mb": round((near * a + SLOW_MAX * b) / 1e6, 1),
+            "near_frames": near, "far_frames": len(slow), "far_max": SLOW_MAX,
+            "far_mb": round(slow_bytes[0] / 1e6, 1), "far_budget_mb": round(FAR_BUDGET / 1e6, 1),
+            "est_mem_mb": round((near * a + slow_bytes[0]) / 1e6, 1),
             "frame_kb": round(a / 1024, 1), "defaults": DEFAULTS}
 
 def apply_cfg(q):
@@ -334,7 +350,9 @@ def apply_cfg(q):
                 "far_step": SLOW_STEP, "far_sec": round(SLOW_STEP * SLOW_MAX, 1), "quality": Q})
     with lock:
         ring = collections.deque(list(ring)[-(int(FPS_HI * SPAN) + 5):], maxlen=int(FPS_HI * SPAN) + 5)
-        slow = collections.deque(list(slow)[-SLOW_MAX:], maxlen=SLOW_MAX)
+        slow = collections.deque(list(slow)[-SLOW_MAX:])
+        slow_bytes[0] = sum(len(j) for _, j in slow)
+        trim_slow()
     save_cfg()
     return cfg_state()
 
@@ -367,9 +385,9 @@ def slow_loop():
         if SLOW_SIZE:
             b = io.BytesIO()
             im.resize(SLOW_SIZE, Image.BILINEAR).save(b, "JPEG", quality=SLOW_Q, subsampling=SS)
-            slow.append((ts, b.getvalue()))
+            slow_add((ts, b.getvalue()))
         else:
-            slow.append((ts, jb))          # 原帧直接进远层，不再编码
+            slow_add((ts, jb))             # 原帧直接进远层，不再编码
 
 def window(span=10.0, n=100):
     items = snapshot()

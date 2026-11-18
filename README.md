@@ -57,12 +57,13 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 | `EYE_RUNTIME` | 运行参数的 JSON 路径，默认 `~\.dsh\eye-runtime.json` |
 | `EYE_CAPTURE` | 设成 `ffmpeg` 就强制走 ffmpeg 抓屏（调试 / mss 出问题时用） |
 | `EYE_FFMPEG` | 指定 ffmpeg 可执行文件路径 |
+| `EYE_FAR_MB` | 远层（每 2 秒一张那层）内存上限，默认 `320`（MB）；内存紧就调小，能回看的时间会变短 |
 
 ## 开销（本机实测，1920×1080）
 
 - 闲着：约 0.07 核 CPU、120MB 内存（没人动时降到 2fps，画面本来也不变）。
 - 手在动：约 0.5 核、120MB。
-- 默认参数下内存上限约 640MB；磁盘占用 0（全在内存）。
+- 默认参数下内存上限约 320MB 远层 + 近层（实测闲置约 120MB、手在动约 150–200MB，会随内存环填满略涨）；磁盘占用 0（全在内存）。
 - 一张 798×450 的拼图约 222 token，与里面装多少格无关。
 
 ## 隐私
