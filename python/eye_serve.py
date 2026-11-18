@@ -1,5 +1,5 @@
 
-import io, json, os, sys, shutil, threading, time, subprocess, collections, ctypes
+import io, json, os, sys, shutil, threading, time, subprocess, collections, ctypes, base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 import numpy as np
@@ -169,6 +169,10 @@ HOOK = {"want": False, "on": False, "ok": False, "err": "", "events": 0,
         "at": 0.0, "burst": 0.0, "stop": False, "tid": 0}
 HOOK_Q = collections.deque(maxlen=200)
 hook_lock = threading.Lock()
+# 事件时间线：点击 / 换前台窗口 / 滚轮。只记「什么时候、在哪、哪个窗口」，不记内容。
+EVENTS = collections.deque(maxlen=400)
+EV_FG = {"hwnd": 0}
+EV_BURST = {"at": 0.0}   # 刚换过窗口：接下来 1.2 秒拉满帧率，把切换后的画面抓清楚
 
 def hooks_load():
     """配置里 "hooks": true 或环境变量 EYE_HOOKS=1 才开（默认关）。"""
@@ -194,8 +198,15 @@ def drain_hook_clicks():
             hwnd = user32.WindowFromPoint(POINT(hx, hy))
         except Exception:
             hwnd = 0
-        clicks.append({"ts": ts, "x": hx, "y": hy, "btn": bt, "hwnd": int(hwnd or 0),
-                       "title": win_title(hwnd or 0)[:120], "src": "hook"})
+        title = win_title(hwnd or 0)[:120]
+        if bt == "W":     # 滚轮不记进 clicks（那不是点击），只进事件时间线
+            EVENTS.append({"ts": ts, "kind": "scroll", "x": hx, "y": hy,
+                           "hwnd": int(hwnd or 0), "title": title})
+        else:
+            clicks.append({"ts": ts, "x": hx, "y": hy, "btn": bt, "hwnd": int(hwnd or 0),
+                           "title": title, "src": "hook"})
+            EVENTS.append({"ts": ts, "kind": "click", "x": hx, "y": hy, "btn": bt,
+                           "hwnd": int(hwnd or 0), "title": title})
         HOOK["burst"] = ts
         got += 1
     return got
@@ -216,6 +227,10 @@ WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
@@ -304,7 +319,7 @@ def capture():
         d = stats.get("diff")
         now = time.time()
         cap = AUTO["cap"] if AUTO["on"] else FPS_HI   # 自动档只封顶，不改变「什么时候该快」的判据
-        if 0 <= idle_ms() < 1200 or (d is not None and d >= MOVE_DIFF):
+        if now - EV_BURST["at"] < 1.2 or 0 <= idle_ms() < 1200 or (d is not None and d >= MOVE_DIFF):
             want = min(FPS_HI, cap); ADAPT["last_move"] = now
         elif d is not None and d >= SLOW_DIFF:
             want = min(mid_fps, cap); ADAPT["last_move"] = now
@@ -329,6 +344,25 @@ def capture():
             stats["err"] = repr(e)[:200]; time.sleep(0.5); continue
         if HOOK_Q:
             drain_hook_clicks()
+        try:
+            sens_update()
+        except Exception:
+            pass
+        # 换前台窗口 = 硬事件：记一笔、并让下一帧立刻抓（不等 idle 那 200ms）
+        try:
+            fh = int(user32.GetForegroundWindow() or 0)
+        except Exception:
+            fh = 0
+        if fh and fh != EV_FG["hwnd"]:
+            if EV_FG["hwnd"]:
+                EVENTS.append({"ts": time.time(), "kind": "window", "x": -1, "y": -1,
+                               "hwnd": fh, "title": win_title(fh)[:120]})
+                HOOK["burst"] = time.time()
+                EV_BURST["at"] = time.time()
+                ADAPT["last_move"] = time.time()
+            EV_FG["hwnd"] = fh
+            if PWD["on"]:
+                pwd_probe_async()
         past = None
         with th_lock:
             for t_, a_ in reversed(THUMBS.items()):
@@ -376,8 +410,8 @@ def capture():
                 else:
                     AUTO["up_since"] = 0.0
         gap = 1.0 / fps - dt
-        if HOOK["on"] and time.time() - HOOK["burst"] < 0.35:
-            gap = 0.0        # 刚点了鼠标：下一帧立刻抓，别等 idle 那 200ms
+        if time.time() - HOOK["burst"] < 0.35 or time.time() - EV_BURST["at"] < 1.2:
+            gap = 0.0        # 刚点了鼠标 / 刚换窗口：下一帧立刻抓，别等 idle 那 200ms
         if gap > 0:
             time.sleep(gap)
 
@@ -451,6 +485,7 @@ def _hook_thread():
     try:
         WH_MOUSE_LL = 14
         WM_DOWN = {0x0201: "L", 0x0204: "R", 0x020B: "M"}   # 左/右/中键按下
+        WM_WHEEL = 0x020A                                    # 滚轮：也只进事件时间线
         class MSLLHOOKSTRUCT(ctypes.Structure):
             _fields_ = [("pt", POINT), ("mouseData", ctypes.c_uint32),
                         ("flags", ctypes.c_uint32), ("time", ctypes.c_uint32),
@@ -464,7 +499,8 @@ def _hook_thread():
         def proc(nCode, wParam, lParam):
             try:
                 if nCode >= 0:
-                    bt = WM_DOWN.get(int(wParam) & 0xFFFF)
+                    code = int(wParam) & 0xFFFF
+                    bt = WM_DOWN.get(code) or ("W" if code == WM_WHEEL else None)
                     if bt:
                         info = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                         ts = time.time()
@@ -568,6 +604,176 @@ def _load_region():
         pass
 _load_region()
 
+# 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
+# 这样改过抓取范围、换过屏，框还贴在同一块屏幕上，不会跟偏。只是画面模糊，不等于加密。
+MASK = {"on": True, "rects": [], "auto": []}
+# 敏感窗口自动挡：前台窗口标题命中这些词（银行/支付/密码管理这类），就把整个窗口糊掉。
+# 这不是识别密码框（那条实测不可靠已撤），是按窗口标题的保守规则——宁可多糊，别漏。
+SENS = {"on": True, "at": 0.0, "hwnd": 0, "title": "", "box": [],
+        "words": ["银行", "支付", "网银", "密码", "凭据", "支付宝", "微信支付", "钱包",
+                  "bank", "payment", "password", "credential"]}
+SENS_LOCK = threading.Lock()
+# 密码框自动打码：开着时每次换前台窗口，用 UIA 问一下这一窗里哪些框是密码框，把矩形也糊掉。
+PWD = {"on": False, "at": 0.0, "busy": False, "n": 0, "err": ""}
+PWD_LOCK = threading.Lock()
+
+def _load_mask():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            m = (json.load(f) or {}).get("mask")
+        if isinstance(m, dict):
+            MASK["on"] = bool(m.get("on", True))
+            PWD["on"] = bool(m.get("pwd", False))
+            rs = m.get("rects") or []
+            if isinstance(rs, list):
+                out = []
+                for r in rs:
+                    if isinstance(r, (list, tuple)) and len(r) >= 4:
+                        out.append([int(r[0]), int(r[1]), int(r[2]), int(r[3])])
+                MASK["rects"] = out[:40]
+    except Exception:
+        pass
+_load_mask()
+
+def _load_sens():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            v = (json.load(f) or {}).get("sensitive")
+        if isinstance(v, dict):
+            if isinstance(v.get("on"), bool):
+                SENS["on"] = v["on"]
+            ws = v.get("words")
+            if isinstance(ws, list) and ws:
+                SENS["words"] = [str(w) for w in ws if str(w).strip()][:40]
+    except Exception:
+        pass
+_load_sens()
+
+def _win_rect(hwnd):
+    """窗口在屏幕上的矩形；拿不到就空。"""
+    try:
+        r = RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return []
+        w = int(r.right - r.left); h = int(r.bottom - r.top)
+        if w < 40 or h < 40:
+            return []
+        return [int(r.left), int(r.top), w, h]
+    except Exception:
+        return []
+
+def sens_update():
+    """前台窗口标题命中敏感词 → 整窗打码（保守规则：命中就整个窗口糊）。"""
+    now = time.time()
+    if now - SENS["at"] < 0.4:
+        return
+    SENS["at"] = now
+    try:
+        h = int(user32.GetForegroundWindow() or 0)
+    except Exception:
+        h = 0
+    if not SENS["on"] or not h:
+        with SENS_LOCK:
+            SENS["hwnd"] = 0; SENS["title"] = ""; SENS["box"] = []
+        return
+    t = win_title(h)
+    low = t.lower()
+    hit = any((w.lower() in low) for w in SENS["words"] if w)
+    if not hit:
+        with SENS_LOCK:
+            SENS["hwnd"] = h; SENS["title"] = ""; SENS["box"] = []
+        return
+    box = _win_rect(h)
+    with SENS_LOCK:
+        SENS["hwnd"] = h; SENS["title"] = t[:120]; SENS["box"] = box
+
+def sens_rects():
+    with SENS_LOCK:
+        return [list(SENS["box"])] if SENS["box"] else []
+
+def all_mask_rects():
+    """手动框 + 自动挡 + 敏感窗口，全部折成屏幕坐标。"""
+    return mask_rects_screen() + sens_rects()
+
+def mask_rects_screen():
+    """当前所有打码矩形（屏幕坐标）。关着就是空。"""
+    if not MASK["on"]:
+        return []
+    return [[int(v) for v in r[:4]] for r in (list(MASK["rects"]) + list(MASK["auto"]))]
+
+def rect_hit(nd, rects):
+    """这个 UIA 节点（带 x/y/w/h，屏幕坐标）跟任一打码框有重叠吗。"""
+    x = int(nd.get("x") or 0); y = int(nd.get("y") or 0)
+    w = int(nd.get("w") or 0); h = int(nd.get("h") or 0)
+    if w <= 0 or h <= 0:
+        return False
+    for mx, my, mw, mh in rects:
+        if x < mx + mw and mx < x + w and y < my + mh and my < y + h:
+            return True
+    return False
+
+def apply_mask(im):
+    """把要挡的矩形打成马赛克；没框就原样返回。矩形是屏幕坐标，这里折算到帧内。"""
+    if im is None:
+        return im
+    rects = all_mask_rects()
+    if not rects:
+        return im
+    bb = base_box(); ox = int(bb["left"]); oy = int(bb["top"])
+    fw, fh = im.size
+    for sx, sy, mw, mh in rects:
+        x, y = int(sx) - ox, int(sy) - oy
+        x0 = max(0, min(fw, x)); y0 = max(0, min(fh, y))
+        x1 = max(0, min(fw, x + int(mw))); y1 = max(0, min(fh, y + int(mh)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
+        box = (x0, y0, x1, y1)
+        reg = im.crop(box)
+        k = 14
+        sm = reg.resize((max(1, reg.size[0] // k), max(1, reg.size[1] // k)), Image.BILINEAR)
+        im.paste(sm.resize(reg.size, Image.NEAREST), box)
+    return im
+
+def refresh_pwd_masks(force=False):
+    """问 UIA 这一窗里哪些框是密码框，把它们的矩形加进打码区（自动挡密码，不用手框）。"""
+    if not PWD["on"]:
+        return
+    if not PWD_LOCK.acquire(blocking=False):
+        return
+    try:
+        now = time.time()
+        if not force and now - PWD["at"] < 3.0:
+            return
+        PWD["busy"] = True; PWD["at"] = now
+        _refresh_pwd_inner()
+    finally:
+        PWD["busy"] = False
+        PWD_LOCK.release()
+
+def _refresh_pwd_inner():
+    try:
+        d = _ps_run('eye_text.ps1', [0, 150], timeout=10)
+        if not d.get("ok"):
+            PWD["err"] = str(d.get("err") or "uia failed")[:120]; PWD["n"] = 0; MASK["auto"] = []
+            return
+        out = []
+        for nd in d.get("nodes") or []:
+            if not nd.get("p"):
+                continue
+            w = int(nd.get("w") or 0); h = int(nd.get("h") or 0)
+            if w < 6 or h < 6:
+                continue
+            out.append([int(nd.get("x") or 0) - 3, int(nd.get("y") or 0) - 3, w + 6, h + 6])
+        MASK["auto"] = out[:20]; PWD["n"] = len(MASK["auto"]); PWD["err"] = ""
+    except Exception as e:
+        PWD["err"] = repr(e)[:120]
+    finally:
+        PWD["busy"] = False
+
+def pwd_probe_async():
+    if PWD["on"] and not PWD["busy"]:
+        threading.Thread(target=refresh_pwd_masks, daemon=True).start()
+
 def _load_auto():
     try:
         with open(CFG_PATH, "r", encoding="utf-8") as f:
@@ -632,6 +838,9 @@ def save_cfg():
         payload = dict(CFG); payload["region"] = dict(REGION); payload["hooks"] = bool(HOOK["want"])
         payload["auto"] = bool(AUTO["on"])
         payload["monitor"] = int(MON["i"])
+        payload["mask"] = {"on": bool(MASK["on"]), "rects": [list(r) for r in MASK["rects"]],
+                           "pwd": bool(PWD["on"])}
+        payload["sensitive"] = {"on": bool(SENS["on"]), "words": list(SENS["words"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -755,7 +964,7 @@ def render_sheet(win, cols=10, width=798, gap=2, label=True):
     draw = ImageDraw.Draw(canvas)
     for i, (ts, jb) in enumerate(win):
         x = (i % cols) * (cw + gap); y = (i // cols) * (ch + gap)
-        canvas.paste(decode(jb).resize((cw, ch), Image.BILINEAR), (x, y))
+        canvas.paste(apply_mask(decode(jb)).resize((cw, ch), Image.BILINEAR), (x, y))
         if label:
             t = str(i)
             draw.rectangle([x, y, x + 8 * len(t) + 2, y + 11], fill=(0, 0, 0))
@@ -866,16 +1075,28 @@ def activity_loop():
                     "fg": fgi, "fg_at": fgi["at"] if fgi else 0.0,
                     "fg_changed": bool(fgi and fgi["changed"])})
 
+_PS_SEQ = [0]
+
 def _ps_run(script, args, timeout=30):
     """Run one bundled PowerShell helper, passing an output JSON path; returns parsed dict."""
     ps = shutil.which('powershell') or shutil.which('pwsh')
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script)
     if not ps or not os.path.exists(path):
         return {"ok": False, "err": "missing " + script}
-    out = os.path.join(os.environ.get('TEMP') or '.', 'dsh-eye-ps-%d-%d.json' % (os.getpid(), int(time.time() * 1000) % 100000))
+    _PS_SEQ[0] += 1
+    out = os.path.join(os.environ.get('TEMP') or '.',
+                       'dsh-eye-ps-%d-%d-%d.json' % (os.getpid(), _PS_SEQ[0], int(time.time() * 1000) % 100000))
     try:
-        subprocess.run([ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path] + [str(a) for a in args] + [out],
-                       capture_output=True, timeout=timeout)
+        p = subprocess.run([ps, '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path] + [str(a) for a in args] + [out],
+                           capture_output=True, timeout=timeout)
+        if not os.path.exists(out):
+            raw = (p.stderr or b'') or (p.stdout or b'')
+            try:
+                msg = raw.decode('utf-8', 'replace')
+            except Exception:
+                msg = raw.decode('gbk', 'replace')
+            msg = ' '.join(msg.split())[:200]
+            return {"ok": False, "err": "ps: " + (msg or 'no output file')}
         with open(out, 'r', encoding='utf-8') as fh:
             return json.loads(fh.read() or '{}')
     except Exception as e:
@@ -892,6 +1113,19 @@ def text_from_window(hwnd=0, maxn=120):
     d = _ps_run('eye_text.ps1', [int(hwnd or 0), max(5, min(400, int(maxn)))])
     if not d.get('ok'):
         return d
+    # 打码框挡住的字不往外给：先按屏幕坐标把节点滤掉，再拼文本。
+    mr = all_mask_rects()
+    d['masked'] = 0
+    if mr:
+        keep = []
+        for nd in d.get('nodes') or []:
+            if rect_hit(nd, mr):
+                d['masked'] += 1
+                continue
+            keep.append(nd)
+        d['nodes'] = keep
+        if isinstance(d.get('pwds'), list):
+            d['pwds'] = [p for p in d['pwds'] if not rect_hit(p, mr)]
     words = []
     for nd in d.get('nodes') or []:
         t = (nd.get('t') or '').strip()
@@ -924,6 +1158,22 @@ def text_from_pixels(jb, maxn=80):
             pass
     if d.get('ok'):
         d['text'] = '\n'.join((l.get('t') or '') for l in d.get('lines') or [])[:8000]
+    return d
+
+
+def range_hits(hwnd=0, q="", maxn=10):
+    """TextPattern: the exact on-screen rectangle of that text (Chromium/Electron trees are too shallow)."""
+    q = (q or "").strip()
+    if not q:
+        return {"ok": False, "err": "need q", "hits": []}
+    b64 = base64.b64encode(q.encode("utf-8")).decode("ascii")
+    d = _ps_run("eye_find.ps1", [int(hwnd or 0), b64, int(maxn)], timeout=15)
+    if not d.get("ok"):
+        return {"ok": False, "err": d.get("err") or "eye_find failed", "hits": []}
+    rects = all_mask_rects()
+    hits = [h for h in (d.get("hits") or []) if not rect_hit(h, rects)]
+    d["hits"] = hits
+    d["n"] = len(hits)
     return d
 
 
@@ -962,12 +1212,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
                         "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "cursor": [x, y], "clicks": len(clicks),
                         "monitor": dict({"i": MON["i"]}, **mon_box()), "monitors": monitor_list(), "dpi": DPI, "refresh": REFRESH,
+                        "mask": {"on": bool(MASK["on"]), "count": len(MASK["rects"]), "rects": [list(r) for r in MASK["rects"]],
+                                 "coord": "screen", "pwd": bool(PWD["on"]), "auto": len(MASK["auto"]), "auto_err": PWD["err"],
+                                 "sens": {"on": bool(SENS["on"]), "hit": bool(SENS["box"]),
+                                          "title": SENS["title"], "box": list(SENS["box"])}},
                         "last_click_ago": round(time.time() - clicks[-1]["ts"], 2) if clicks else None,
                         "err": stats["err"], "paused": bool(mode.get("paused")), "diff": stats.get("diff"), "want": stats.get("want"), "idle_ms": idle_ms(), "cnt": stats.get("cnt"),
                         "hooks": {"want": bool(HOOK["want"]), "on": bool(HOOK["on"]), "ok": bool(HOOK["ok"]),
                                   "events": HOOK["events"], "err": HOOK["err"],
                                   "last_event_ago": round(time.time() - HOOK["at"], 2) if HOOK["at"] else None},
                         "auto": {"on": bool(AUTO["on"]), "cap": AUTO["cap"], "avg_ms": AUTO["avg_ms"], "note": AUTO["note"]},
+                        "events": {"n": len(EVENTS), "last": (EVENTS[-1]["kind"] if EVENTS else ""),
+                                   "last_ago": (round(time.time() - EVENTS[-1]["ts"], 2) if EVENTS else None)},
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
         if u.path == "/monitors":
@@ -1030,6 +1286,59 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "hint": "拖一个框，松手生效；点一下不拖或按 Esc = 恢复全屏"}); return
             except Exception as e:
                 self._json({"ok": False, "error": repr(e)}); return
+        if u.path == "/mask":
+            if "off" in q:
+                MASK["on"] = False
+            elif "on" in q:
+                MASK["on"] = str(q.get("on")).strip().lower() not in ("0", "false", "off", "no")
+            elif "clear" in q:
+                MASK["rects"] = []
+            elif "w" in q and "h" in q:
+                mw = i_("w", 0); mh = i_("h", 0)
+                if mw >= 8 and mh >= 8:
+                    # 一律按屏幕坐标存；出图/读字时再按当前抓取区域折算到帧内（换区域不会跟偏）
+                    MASK["rects"].append([i_("x", 0), i_("y", 0), mw, mh])
+                    MASK["rects"] = MASK["rects"][-40:]
+                    MASK["on"] = True
+            else:
+                self._json({"on": bool(MASK["on"]), "rects": [list(r) for r in MASK["rects"]],
+                            "count": len(MASK["rects"]), "size": list(frame_size()), "coord": "screen",
+                            "hint": "坐标是屏幕像素（/state 的 cursor、clicks 都是屏幕坐标）。打码同时挡住出图和读字：框住的地方既不进图、也不进 eye_text。只是糊掉，不等于加密；原始帧只在内存里、不落盘"}); return
+            save_cfg()
+            self._json({"ok": True, "on": bool(MASK["on"]), "count": len(MASK["rects"]),
+                        "rects": [list(r) for r in MASK["rects"]],
+                        "hint": "开着的图上，这些区域会被打成马赛克"}); return
+        if u.path == "/sensitive":
+            if "on" in q:
+                SENS["on"] = str(q.get("on")).strip().lower() not in ("0", "false", "off", "no")
+                if not SENS["on"]:
+                    with SENS_LOCK:
+                        SENS["box"] = []; SENS["title"] = ""
+                else:
+                    SENS["at"] = 0.0
+                save_cfg()
+            self._json({"on": bool(SENS["on"]), "words": list(SENS["words"]),
+                        "hit": bool(SENS["box"]), "title": SENS["title"], "box": list(SENS["box"]),
+                        "hint": "开着时前台窗口标题命中敏感词（银行/支付/密码…）就把整个窗口糊掉；想加词改 " + CFG_PATH + " 里 sensitive.words"}); return
+        if u.path == "/mask/pick":
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                subprocess.Popen([sys.executable, os.path.join(here, "eye_mask.py")],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._json({"ok": True, "hint": "拖一个框，松手就把这块加进打码区；按 Esc 取消"}); return
+            except Exception as e:
+                self._json({"ok": False, "error": repr(e)}); return
+        if u.path == "/mask/pwd":
+            if "on" in q:
+                PWD["on"] = str(q.get("on")).strip().lower() not in ("0", "false", "off", "no")
+                if PWD["on"]:
+                    pwd_probe_async()
+                else:
+                    MASK["auto"] = []; PWD["n"] = 0
+                save_cfg()
+            self._json({"pwd": bool(PWD["on"]), "auto": [list(r) for r in MASK["auto"]], "n": PWD["n"],
+                        "err": PWD["err"],
+                        "hint": "开着时每次换前台窗口会用无障碍接口问一遍密码框，自动糊掉；认不出就自己框。只是画面模糊，不是加密"}); return
         if u.path == "/config":
             self._json(apply_cfg(q) if q else cfg_state()); return
         if u.path == "/cursor":
@@ -1041,6 +1350,14 @@ class Handler(BaseHTTPRequestHandler):
             out = [{"ago": round(now - c["ts"], 2), "x": c["x"], "y": c["y"], "title": c["title"],
                     "src": c.get("src", "poll")} for c in list(clicks)[-20:]]
             out.reverse(); self._json({"clicks": out}); return
+        if u.path == "/events":
+            n = i_("n", 30)
+            now = time.time()
+            out = [{"ago": round(now - e["ts"], 2), "kind": e["kind"], "x": e["x"], "y": e["y"],
+                    "title": e.get("title", "")} for e in list(EVENTS)[-n:]]
+            out.reverse()
+            self._json({"events": out, "n": len(EVENTS),
+                        "hint": "kind = click / scroll / window；时间从近到远，ago 单位秒"}); return
         if u.path == "/echo_info":
             seg, c = echo_frames(f("before", 1.0), f("after", 1.0))
             if not c: self._json({"error": "no click yet"}); return
@@ -1071,7 +1388,7 @@ class Handler(BaseHTTPRequestHandler):
             draw = ImageDraw.Draw(canvas)
             x0 = max(0, min(W - fw, c["x"] - fw // 2)); y0 = max(0, min(H - fh, c["y"] - fh // 2))
             for k, (ts, jb, dt) in enumerate(cells[:4]):
-                im = decode(jb).crop((x0, y0, x0 + fw, y0 + fh)).resize((cw, ch), Image.BILINEAR)
+                im = apply_mask(decode(jb)).crop((x0, y0, x0 + fw, y0 + fh)).resize((cw, ch), Image.BILINEAR)
                 cx2 = (k % 2) * (cw + gap); cy2 = (k // 2) * (ch + gap)
                 canvas.paste(im, (cx2, cy2))
                 tag = ("%+.2fs" % dt)
@@ -1102,7 +1419,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 target = items[-1][0] - f("t", 0)
                 best = min(items, key=lambda x: abs(x[0] - target))
-            im = decode(best[1])
+            im = apply_mask(decode(best[1]))
             if u.path.startswith("/fovea") or "fw" in q:
                 fw = i_("fw", 700); fh = i_("fh", 393)
                 FW, FH = frame_size()
@@ -1119,7 +1436,7 @@ class Handler(BaseHTTPRequestHandler):
             items = snapshot()
             if not items: self._json({"error": "no frames"}); return
             try:
-                im = decode(items[-1][1])
+                im = apply_mask(decode(items[-1][1]))
             except Exception:
                 self._json({"error": "decode"}); return
             tw = max(80, min(1280, i_("w", 480)))
@@ -1134,6 +1451,8 @@ class Handler(BaseHTTPRequestHandler):
             if not items: self._json({"error": "no frames"}); return
             target = items[-1][0] - f("t", 0)
             best = min(items, key=lambda x: abs(x[0] - target))
+            if all_mask_rects():
+                self._img(apply_mask(decode(best[1]))); return
             d = best[1]
             self.send_response(200); self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d); return
@@ -1152,7 +1471,14 @@ class Handler(BaseHTTPRequestHandler):
             got = int(d.get("readable") or 0) if d.get("ok") else 0
             if tmode == "ocr" or (tmode == "auto" and got < 3):
                 items = snapshot()
-                ocr = text_from_pixels(items[-1][1], min(120, mx)) if items else {"ok": False, "err": "no frames"}
+                jb = items[-1][1] if items else None
+                if jb and all_mask_rects():
+                    # OCR 走像素，也得先糊一遍再喂进去，否则打码对读字形同虚设
+                    try:
+                        buf = io.BytesIO(); apply_mask(decode(jb)).save(buf, "JPEG", quality=85); jb = buf.getvalue()
+                    except Exception:
+                        pass
+                ocr = text_from_pixels(jb, min(120, mx)) if jb else {"ok": False, "err": "no frames"}
                 if tmode == "ocr":
                     d = ocr
                 elif got == 0:
@@ -1160,6 +1486,87 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     d["ocr"] = ocr
             self._json(d); return
+        if u.path == "/find":
+            fq = (q.get("q") or [""])[0].strip()
+            if not fq:
+                self._json({"ok": False, "err": "need q"}); return
+            hwnd = i_("hwnd", 0)
+            if not hwnd:
+                try:
+                    hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                except Exception:
+                    hwnd = 0
+            mx = max(10, min(400, i_("max", 200)))
+            d = text_from_window(hwnd, mx)
+            if not d.get("ok"):
+                self._json({"ok": False, "err": d.get("err") or "uia failed"}); return
+            key = fq.lower()
+            rects = all_mask_rects()
+            hits = []
+            for nd in (d.get("nodes") or []):
+                blob = (" ".join([str(nd.get("n") or ""), str(nd.get("v") or ""), str(nd.get("t") or "")])).lower()
+                if key not in blob:
+                    continue
+                if rect_hit(nd, rects):
+                    continue
+                x = int(nd.get("x") or 0); y = int(nd.get("y") or 0)
+                w = int(nd.get("w") or 0); h = int(nd.get("h") or 0)
+                if w <= 0 or h <= 0:
+                    continue
+                nm = (nd.get("n") or nd.get("v") or (nd.get("t") or "")[:60]).strip()
+                hits.append({"name": nm[:90], "role": str(nd.get("r") or ""), "src": "uia",
+                             "x": x, "y": y, "w": w, "h": h, "cx": x + w // 2, "cy": y + h // 2})
+                if len(hits) >= 40:
+                    break
+            src = "uia"
+            note = ""
+            wr = _win_rect(hwnd) or []
+            warea = (int(wr[2]) * int(wr[3])) if len(wr) >= 4 else 0
+            blunt = [h for h in hits
+                     if ("Document" in h["role"]) or ("Window" in h["role"]) or ("Pane" in h["role"])
+                     or (warea and h["w"] * h["h"] > warea * 0.15)]
+            if (not hits) or (len(blunt) == len(hits)):
+                # Chromium/Electron: ControlView tree is one window-sized Document; use document text ranges instead
+                rd = range_hits(hwnd, fq, 12)
+                rh = rd.get("hits") or []
+                if rh:
+                    hits = [{"name": fq, "role": "文字", "src": "uia-range",
+                             "x": int(h["x"]), "y": int(h["y"]), "w": int(h["w"]), "h": int(h["h"]),
+                             "cx": int(h["cx"]), "cy": int(h["cy"])} for h in rh]
+                    src = "uia-range"
+                    note = "（按文档里的文字定位，坐标是那段字在屏幕上的矩形）"
+            ocr_note = ""
+            if not hits:
+                # 无障碍树里找不到（Qt / 自绘界面 / 游戏）：退回本地 OCR，按屏幕文字找坐标。
+                items = snapshot()
+                jb = items[-1][1] if items else None
+                if jb:
+                    try:
+                        if all_mask_rects():
+                            buf = io.BytesIO(); apply_mask(decode(jb)).save(buf, "JPEG", quality=85); jb = buf.getvalue()
+                        ocr = text_from_pixels(jb, 160)
+                    except Exception as ex:
+                        ocr = {"ok": False, "err": str(ex)}
+                    norm = lambda s: "".join(str(s or "").split()).lower()
+                    key2 = norm(fq)
+                    for ln in (ocr.get("lines") or []):
+                        if key2 and key2 in norm(ln.get("t")):
+                            x = int(ln.get("x") or 0); y = int(ln.get("y") or 0)
+                            w = int(ln.get("w") or 0); h = int(ln.get("h") or 0)
+                            if w <= 0 or h <= 0:
+                                continue
+                            hits.append({"name": str(ln.get("t"))[:90], "role": "OCR", "src": "ocr",
+                                         "x": x, "y": y, "w": w, "h": h, "cx": x + w // 2, "cy": y + h // 2})
+                            if len(hits) >= 20:
+                                break
+                    if hits:
+                        src = "ocr"
+                        ocr_note = "（无障碍树里没有，这是本地 OCR 按屏幕文字找的，整屏坐标，小字可能错）"
+                    else:
+                        ocr_note = "（无障碍树和本地 OCR 都没找到）"
+            self._json({"ok": True, "q": fq, "hwnd": hwnd, "title": d.get("title"), "ms": d.get("ms"),
+                        "count": len(hits), "items": hits, "masked": d.get("masked") or 0,
+                        "src": src, "note": note or ocr_note}); return
         if u.path == "/activity":
             a = dict(act)
             a["ago"] = round(time.time() - a["at"], 2) if a["at"] else None

@@ -14,6 +14,11 @@ import time
 import urllib.request
 import tkinter as tk
 
+try:
+    import numpy as np
+except Exception:
+    np = None
+
 _u32 = ctypes.windll.user32
 _k32 = ctypes.windll.kernel32
 
@@ -58,6 +63,183 @@ def load_geo(sw, sh):
         return 380, 320, sw - 404, sh - 392
 
 
+class Voice:
+    """小窗的语音输入：手动点一下说、再点一下停，或者自动听（说完就发）。
+
+    录音只在内存里，转写完就丢；模型是 faster-whisper（离线 CPU），第一次用时才加载。
+    """
+
+    RATE = 16000
+    BLOCK = 480
+
+    def __init__(self, win):
+        self.win = win
+        self.sd = None
+        self.stream = None
+        self.mode = "off"     # off / ptt / auto
+        self.busy = False
+        self.lock = threading.Lock()
+        self.buf = bytearray()
+        self.utt = bytearray()
+        self.speaking = False
+        self.silence = 0.0
+        self.noise = 0.004
+        self.error = ""
+
+    def _ensure(self):
+        if self.sd is None:
+            import sounddevice as sd
+            self.sd = sd
+        return self.sd
+
+    def preload(self):
+        try:
+            import eye_stt
+            ok, _why = eye_stt.available()
+        except Exception:
+            ok = False
+        if not ok:
+            return   # 没装语音依赖：小窗照常用，不提示、不加载
+
+        def go():
+            try:
+                import eye_stt
+                eye_stt.load()
+                self.win.root.after(0, lambda: self.win.ui_status("语音就绪"))
+            except Exception as e:
+                self.error = str(e)[:120]
+                self.win.root.after(0, lambda: self.win.ui_status("语音模型没装上"))
+        threading.Thread(target=go, daemon=True).start()
+
+    # ---- 手动：一次录一段 ----
+    def start_ptt(self):
+        if self.busy:
+            return "正在转写，稍等"
+        sd = self._ensure()
+        with self.lock:
+            self.buf = bytearray()
+        self.stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype="int16",
+                                     blocksize=self.BLOCK, callback=self._cb_ptt)
+        self.stream.start()
+        self.mode = "ptt"
+        return ""
+
+    def _cb_ptt(self, indata, frames, t, status):
+        with self.lock:
+            self.buf += bytes(indata)
+
+    def stop_ptt(self):
+        if self.mode != "ptt":
+            return
+        try:
+            self.stream.stop(); self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        self.mode = "off"
+        with self.lock:
+            data = bytes(self.buf); self.buf = bytearray()
+        if len(data) < self.RATE // 4:
+            self.win.ui_status("太短了")
+            return
+        self._transcribe_async(data)
+
+    # ---- 自动：一直听，说完一句自己停 ----
+    def start_auto(self):
+        if self.busy:
+            return "正在转写，稍等"
+        if np is None:
+            return "没有 numpy，自动听用不了"
+        sd = self._ensure()
+        with self.lock:
+            self.utt = bytearray()
+        self.speaking = False
+        self.silence = 0.0
+        self.stream = sd.InputStream(samplerate=self.RATE, channels=1, dtype="int16",
+                                     blocksize=self.BLOCK, callback=self._cb_auto)
+        self.stream.start()
+        self.mode = "auto"
+        return ""
+
+    def _cb_auto(self, indata, frames, t, status):
+        raw = bytes(indata)
+        trim = None
+        if np is not None:
+            a = np.frombuffer(raw, dtype=np.int16).astype("float32") / 32768.0
+            rms = float(np.sqrt(float(np.mean(a * a)) + 1e-12))
+            loud = rms > max(0.010, self.noise * 3.5)
+            if not loud and not self.speaking:
+                self.noise = 0.95 * self.noise + 0.05 * rms
+            with self.lock:
+                self.utt += raw
+                if len(self.utt) > self.RATE * 2 * 20:
+                    self.utt = self.utt[-self.RATE * 2 * 10:]
+            if loud:
+                self.speaking = True
+                self.silence = 0.0
+            elif self.speaking:
+                self.silence += len(raw) / 2.0 / self.RATE
+                if self.silence > 0.7:
+                    with self.lock:
+                        trim = bytes(self.utt); self.utt = bytearray()
+                    self.speaking = False
+                    self.silence = 0.0
+        if trim is not None:
+            if len(trim) >= self.RATE // 2:
+                self._transcribe_async(trim)
+        elif raw and self.mode != "auto":
+            pass
+
+    def stop_auto(self):
+        if self.mode != "auto":
+            return
+        try:
+            self.stream.stop(); self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        self.mode = "off"
+        with self.lock:
+            data = bytes(self.utt); self.utt = bytearray()
+        if len(data) >= self.RATE // 2 and not self.busy:
+            self._transcribe_async(data)
+
+    def stop_all(self):
+        try:
+            if self.stream is not None:
+                self.stream.stop(); self.stream.close()
+        except Exception:
+            pass
+        self.stream = None
+        self.mode = "off"
+
+    def _transcribe_async(self, data):
+        if self.busy:
+            return
+        self.busy = True
+        self.win.ui_status("转写中…")
+        def go():
+            txt = ""
+            err = ""
+            try:
+                import eye_stt
+                txt = eye_stt.transcribe_pcm(data, self.RATE)
+            except Exception as e:
+                err = str(e)[:120]
+            finally:
+                self.busy = False
+            def back():
+                if err:
+                    self.win.ui_status("语音识别失败：" + err)
+                else:
+                    self.win.on_voice_text(txt)
+            try:
+                self.win.root.after(0, back)
+            except Exception:
+                pass
+        threading.Thread(target=go, daemon=True).start()
+
+
 class ChatWin:
     def __init__(self):
         self.last = 0
@@ -91,6 +273,14 @@ class ChatWin:
 
         foot = tk.Frame(inner, bg=BG)
         foot.pack(fill="x", side="bottom", padx=(6, 18), pady=(0, 6))
+        self.mic = tk.Label(foot, text="\U0001F3A4", bg=BG, fg="#5f7d99", font=("Microsoft YaHei UI", 11),
+                            padx=2, cursor="hand2")
+        self.mic.pack(side="left", padx=(0, 1))
+        self.mic.bind("<Button-1>", lambda e: self.toggle_ptt())
+        self.auto = tk.Label(foot, text="\U0001F3A7", bg=BG, fg="#5f7d99", font=("Microsoft YaHei UI", 11),
+                             padx=2, cursor="hand2")
+        self.auto.pack(side="left", padx=(0, 4))
+        self.auto.bind("<Button-1>", lambda e: self.toggle_auto())
         self.entry = tk.Entry(foot, bg="#101a24", fg=FG, font=FONT, bd=0,
                               insertbackground="#8fc6ff", highlightthickness=1,
                               highlightbackground="#1e2c3c", highlightcolor="#3a6f9c",
@@ -146,6 +336,8 @@ class ChatWin:
         self.root.after(400, self._focus_typing)
         self.root.after(600, self._assert_focus)
         threading.Thread(target=self._beat, daemon=True).start()
+        self.voice = Voice(self)
+        self.root.after(1500, self.voice.preload)
 
     def _beat(self):
         """告诉眼睛服务「这个窗口还活着」：窗口不是插件自己起的，也能被认出来。"""
@@ -264,6 +456,10 @@ class ChatWin:
             pass
 
     def close(self):
+        try:
+            self.voice.stop_all()   # 关窗就别再录了
+        except Exception:
+            pass
         self.save_geo()
         self.root.destroy()
 
@@ -283,6 +479,55 @@ class ChatWin:
         self.txt.insert("end", ("我： " if tag == "me" else "你： " if tag == "you" else "") + text + "\n", tag)
         self.txt.configure(state="disabled")
         self.txt.see("end")
+
+    def ui_status(self, text):
+        try:
+            self.status.configure(text=str(text)[:26])
+        except Exception:
+            pass
+
+    def toggle_ptt(self):
+        if self.voice.mode == "ptt":
+            self.mic.configure(fg="#5f7d99")
+            self.voice.stop_ptt()
+            self.ui_status("\u8f6c\u5199\u4e2d\u2026")
+            return
+        if self.voice.mode == "auto":
+            self._toggle_auto_off()
+        err = self.voice.start_ptt()
+        if err:
+            self.ui_status(err)
+            return
+        self.mic.configure(fg="#ff8a7a")
+        self.ui_status("\u5728\u542c\u2026\u518d\u70b9\u4e00\u4e0b")
+
+    def _toggle_auto_off(self):
+        self.auto.configure(fg="#5f7d99")
+        self.voice.stop_auto()
+
+    def toggle_auto(self):
+        if self.voice.mode == "auto":
+            self._toggle_auto_off()
+            return
+        if self.voice.mode == "ptt":
+            self.mic.configure(fg="#5f7d99")
+            self.voice.stop_ptt()
+        err = self.voice.start_auto()
+        if err:
+            self.ui_status(err)
+            return
+        self.auto.configure(fg="#35c07a")
+        self.ui_status("\u81ea\u52a8\u542c\uff1a\u8bf4\u5b8c\u5c31\u53d1")
+
+    def on_voice_text(self, txt):
+        txt = (txt or "").strip()
+        if not txt:
+            self.ui_status("\u6ca1\u542c\u6e05")
+            return
+        self.entry.delete(0, "end")
+        self.entry.insert(0, txt)
+        self.ui_status("\u8bed\u97f3\u5df2\u53d1")
+        self.send()
 
     def send(self):
         t = self.entry.get().strip()
