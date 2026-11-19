@@ -732,7 +732,7 @@ _load_vision()
 # 看过的东西留档（0.4.0 试点）：本地变化够大才把那一帧缩成小图存盘，滚动保留最近 N 张。
 # 目的不是录屏，是「下午三点那个弹窗写的什么」还能翻回来。存的是打过码的画面，跟出图口径一致。
 ARCH = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "err": "", "saved": 0, "last": 0.0, "day": "",
-        "ttl": 7200.0, "max_mb": 100.0, "last_trim": 0.0}
+        "ttl": 0.0, "max_mb": 100.0, "last_trim": 0.0}
 # 插件根目录（本文件在 <插件>/python/ 下）——留档默认放 <插件>/archive
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCH_LOCK = threading.Lock()
@@ -798,9 +798,10 @@ def _load_archive():
         ARCH["keep"] = 1200
     ARCH["dir"] = str(d.get("dir") or "").strip()
     try:
-        ARCH["ttl"] = max(60.0, min(7 * 86400.0, float(d.get("ttl") or 7200.0)))
+        tv = float(d.get("ttl") or 0.0)
+        ARCH["ttl"] = 0.0 if tv <= 0 else max(60.0, min(7 * 86400.0, tv))
     except Exception:
-        ARCH["ttl"] = 7200.0
+        ARCH["ttl"] = 0.0
     try:
         ARCH["max_mb"] = max(10.0, min(4096.0, float(d.get("max_mb") or 100.0)))
     except Exception:
@@ -813,11 +814,13 @@ def _load_archive():
 _load_archive()
 
 def _arch_trim(force=False):
-    """两条红线：超过 ttl（默认 2 小时）的删掉；总量超过 keep 的删最早。"""
+    """两条红线：张数超过 keep、总量超过 max_mb，都从最老的开始删。
+    ttl > 0 时才额外按时间删（默认 0 = 不按时间删，能留多久由前两条参数算出来）。"""
     keep = int(ARCH["keep"])
     entries = _arch_read(0)
-    cutoff = time.time() - float(ARCH["ttl"] or 7200.0)
-    fresh = [e for e in entries if float(e.get("ts") or 0) >= cutoff]
+    ttl = float(ARCH["ttl"] or 0.0)
+    cutoff = time.time() - ttl if ttl > 0 else 0.0
+    fresh = [e for e in entries if float(e.get("ts") or 0) >= cutoff] if ttl > 0 else list(entries)
     aged = len(entries) - len(fresh)
     if not force and aged == 0 and len(entries) <= keep * 1.25:
         return
@@ -883,22 +886,36 @@ def arch_save(ts, im, score=0.0, note=""):
 
 def arch_state():
     oldest = None
+    total = 0.0
+    est = {"avg_gap": None, "avg_kb": None, "est_n": None, "est_sec": None}
     try:
         ents = _arch_read(0)
         if ents:
             oldest = round(time.time() - float(ents[0].get("ts") or 0), 0)
-    except Exception:
-        pass
-    total = 0.0
-    try:
-        total = sum(float(e.get("bytes") or 0) for e in _arch_read(0))
+            total = sum(float(e.get("bytes") or 0) for e in ents)
+            # 按最近的样本算「平均多久存一张」「一张多大」，再按当前 keep / max_mb 反推能留多久
+            tail = ents[-200:]
+            if len(tail) >= 2:
+                gaps = [float(tail[i].get("ts") or 0) - float(tail[i - 1].get("ts") or 0) for i in range(1, len(tail))]
+                gaps = [g for g in gaps if g > 0.2]
+                kbs = [float(e.get("bytes") or 0) / 1024.0 for e in tail if float(e.get("bytes") or 0) > 0]
+                if gaps and kbs:
+                    ag = sum(gaps) / len(gaps)
+                    ak = sum(kbs) / len(kbs)
+                    budget = float(ARCH["max_mb"] or 100.0) * 1024.0      # KB
+                    by_keep = int(ARCH["keep"])
+                    by_mb = int(budget / ak) if ak > 0 else by_keep
+                    n = max(1, min(by_keep, by_mb))
+                    est = {"avg_gap": round(ag, 1), "avg_kb": round(ak, 1), "est_n": n, "est_sec": round(n * ag, 0)}
     except Exception:
         pass
     return {"on": bool(ARCH["on"]), "dir": _arch_dir(), "keep": int(ARCH["keep"]),
             "min_gap": float(ARCH["min_gap"]), "saved": int(ARCH["saved"]), "err": ARCH["err"],
             "ttl_hours": round(float(ARCH["ttl"]) / 3600.0, 2), "oldest_ago": oldest,
             "max_mb": float(ARCH["max_mb"]), "mb": round(total / 1048576.0, 1),
-            "last_ago": (round(time.time() - float(ARCH["last"]), 1) if ARCH["last"] else None)}
+            "last_ago": (round(time.time() - float(ARCH["last"]), 1) if ARCH["last"] else None),
+            "avg_gap": est["avg_gap"], "avg_kb": est["avg_kb"],
+            "est_n": est["est_n"], "est_sec": est["est_sec"]}
 
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
 # 这样改过抓取范围、换过屏，框还贴在同一块屏幕上，不会跟偏。只是画面模糊，不等于加密。
@@ -1915,7 +1932,8 @@ class Handler(BaseHTTPRequestHandler):
                 if "min_gap" in q:
                     ARCH["min_gap"] = max(0.5, min(600.0, f("min_gap", 3.0)))
                 if "ttl" in q:
-                    ARCH["ttl"] = max(60.0, min(7 * 86400.0, f("ttl", 7200.0)))
+                    tv = f("ttl", 0.0)
+                    ARCH["ttl"] = 0.0 if tv <= 0 else max(60.0, min(7 * 86400.0, tv))
                 if "max_mb" in q:
                     ARCH["max_mb"] = max(10.0, min(4096.0, f("max_mb", 100.0)))
                 if "trim" in q:
