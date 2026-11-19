@@ -14,6 +14,17 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 脚本会：把插件和 python 部分复制到 `%USERPROFILE%\.dsh\plugins\dsh-eye`、装 numpy + pillow、写 `~\.dsh\eye.json`、把插件挂进 DSH profile（带侧边栏入口）、检查 ffmpeg。**装完重启一次 DSH**，左侧栏出现「眼睛」，点「打开」。
 
+## 装完打不开？面板里点「一键准备」
+
+左侧栏「眼睛」面板下方有个「环境准备」，点一次「一键准备」：
+
+- 查 Python（3.9 以下或没装会直接告诉你装哪个）
+- 缺 `numpy` / `pillow` / `mss` 就当场 `pip install -r python/requirements.txt`
+- 找 ffmpeg；有 winget 就顺手装，没有就给下载地址
+- 把脚本路径写进 `%USERPROFILE%\.dsh\eye.json`（没跑过 install.ps1、只 `dsh plugin add` 的人靠这一步）
+
+只在**本机**执行，不上传任何东西。装在别的盘、Python 在奇怪的位置都能认。
+
 ## 可选参数
 
 | 参数 | 作用 |
