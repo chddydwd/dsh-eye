@@ -729,6 +729,134 @@ def _load_vision():
     vision_state()   # 跨天就清零（只算今天）
 _load_vision()
 
+# 看过的东西留档（0.4.0 试点）：本地变化够大才把那一帧缩成小图存盘，滚动保留最近 N 张。
+# 目的不是录屏，是「下午三点那个弹窗写的什么」还能翻回来。存的是打过码的画面，跟出图口径一致。
+ARCH = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "err": "", "saved": 0, "last": 0.0, "day": ""}
+ARCH_LOCK = threading.Lock()
+
+def _arch_dir():
+    return ARCH["dir"] or os.path.join(os.path.expanduser("~"), ".dsh", "eye-archive")
+
+def _arch_index():
+    return os.path.join(_arch_dir(), "index.jsonl")
+
+def _arch_read(limit=200, since=0.0, q=""):
+    out = []
+    try:
+        with open(_arch_index(), "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(e, dict):
+                    out.append(e)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        ARCH["err"] = repr(e)[:160]
+        return []
+    if since:
+        out = [e for e in out if float(e.get("ts") or 0) >= float(since)]
+    if q:
+        qq = str(q).lower()
+        out = [e for e in out if qq in str(e.get("title") or "").lower() or qq in str(e.get("note") or "").lower()]
+    out.sort(key=lambda e: float(e.get("ts") or 0))
+    if limit and len(out) > int(limit):
+        out = out[-int(limit):]
+    return out
+
+def _load_archive():
+    d = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": ""}
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            a = (json.load(f) or {}).get("archive")
+        if isinstance(a, dict):
+            for k in d:
+                if k in a:
+                    d[k] = a[k]
+    except Exception:
+        pass
+    ARCH["on"] = bool(d.get("on", True))
+    try:
+        ARCH["min_gap"] = max(0.5, min(600.0, float(d.get("min_gap") or 3.0)))
+    except Exception:
+        ARCH["min_gap"] = 3.0
+    try:
+        ARCH["keep"] = max(20, min(20000, int(d.get("keep") or 1200)))
+    except Exception:
+        ARCH["keep"] = 1200
+    ARCH["dir"] = str(d.get("dir") or "").strip()
+    try:
+        os.makedirs(_arch_dir(), exist_ok=True)
+    except Exception as e:
+        ARCH["err"] = repr(e)[:160]
+    ARCH["saved"] = len(_arch_read(0))
+_load_archive()
+
+def _arch_trim():
+    keep = int(ARCH["keep"])
+    entries = _arch_read(0)
+    if len(entries) <= keep * 1.25:
+        return
+    keepers = entries[-keep:]
+    files = set(str(e.get("file") or "") for e in keepers)
+    try:
+        tmp = _arch_index() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for e in keepers:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        os.replace(tmp, _arch_index())
+        for fn in os.listdir(_arch_dir()):
+            if fn.endswith(".jpg") and fn not in files:
+                try:
+                    os.remove(os.path.join(_arch_dir(), fn))
+                except Exception:
+                    pass
+    except Exception as e:
+        ARCH["err"] = repr(e)[:160]
+    ARCH["saved"] = len(keepers)
+
+def arch_save(ts, im, score=0.0, note=""):
+    """变化够大时存一张缩略图（先打码）+ 索引一行。失败只记错，不影响采集。"""
+    if not ARCH["on"]:
+        return
+    if ts - float(ARCH["last"] or 0) < float(ARCH["min_gap"]):
+        return
+    try:
+        pic = apply_mask(im)
+        tw = 640
+        if pic.size[0] > tw:
+            pic = pic.resize((tw, max(1, int(pic.size[1] * tw / pic.size[0]))), Image.BILINEAR)
+        name = time.strftime("%H%M%S", time.localtime(ts)) + ("-%03d" % int((ts % 1) * 1000)) + ".jpg"
+        b = io.BytesIO()
+        pic.save(b, "JPEG", quality=70, subsampling=SS)
+        data = b.getvalue()
+        with open(os.path.join(_arch_dir(), name), "wb") as f:
+            f.write(data)
+        try:
+            title = fg_title()[:120]
+        except Exception:
+            title = ""
+        e = {"ts": round(ts, 3), "file": name, "title": title, "score": round(float(score or 0), 1),
+             "w": pic.size[0], "h": pic.size[1], "bytes": len(data), "note": str(note or "")[:80]}
+        with ARCH_LOCK:
+            with open(_arch_index(), "a", encoding="utf-8") as f:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+            ARCH["saved"] = int(ARCH["saved"]) + 1
+            ARCH["last"] = ts
+        _arch_trim()
+    except Exception as e:
+        ARCH["err"] = repr(e)[:160]
+
+def arch_state():
+    return {"on": bool(ARCH["on"]), "dir": _arch_dir(), "keep": int(ARCH["keep"]),
+            "min_gap": float(ARCH["min_gap"]), "saved": int(ARCH["saved"]), "err": ARCH["err"],
+            "last_ago": (round(time.time() - float(ARCH["last"]), 1) if ARCH["last"] else None)}
+
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
 # 这样改过抓取范围、换过屏，框还贴在同一块屏幕上，不会跟偏。只是画面模糊，不等于加密。
 MASK = {"on": True, "rects": [], "auto": []}
@@ -992,6 +1120,8 @@ def save_cfg():
         payload["focus"] = {"on": bool(FOCUS["on"]), "x": int(FOCUS["x"]), "y": int(FOCUS["y"]),
                             "w": int(FOCUS["w"]), "h": int(FOCUS["h"]), "hwnd": int(FOCUS["hwnd"]),
                             "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"])}
+        payload["archive"] = {"on": bool(ARCH["on"]), "min_gap": float(ARCH["min_gap"]),
+                              "keep": int(ARCH["keep"]), "dir": str(ARCH["dir"])}
         payload["vision"] = {"on": bool(VISION["on"]), "budget": int(VISION["budget"]),
                              "calls": int(VISION["calls"]), "tokens": int(VISION["tokens"]), "day": str(VISION["day"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
@@ -1086,8 +1216,17 @@ def slow_loop():
             im = decode(jb)
         except Exception:
             continue
-        last_g = _gray(jb)
+        try:
+            newg = _gray(jb)
+            score = float(np.abs(newg - last_g).mean()) if (newg is not None and last_g is not None) else 0.0
+            last_g = newg
+        except Exception:
+            score = 0.0
         last_ts = ts
+        try:
+            arch_save(ts, im, score)
+        except Exception:
+            pass
         if SLOW_SIZE:
             b = io.BytesIO()
             im.resize(SLOW_SIZE, Image.BILINEAR).save(b, "JPEG", quality=SLOW_Q, subsampling=SS)
@@ -1399,6 +1538,7 @@ class Handler(BaseHTTPRequestHandler):
                         "auto": {"on": bool(AUTO["on"]), "cap": AUTO["cap"], "avg_ms": AUTO["avg_ms"], "note": AUTO["note"]},
                         "events": {"n": len(EVENTS), "last": (EVENTS[-1]["kind"] if EVENTS else ""),
                                    "last_ago": (round(time.time() - EVENTS[-1]["ts"], 2) if EVENTS else None)},
+                        "archive": arch_state(),
                         "slow_frames": len(slow),
                         "slow_span_sec": round(slow[-1][0] - slow[0][0], 1) if len(slow) > 1 else 0}); return
         if u.path == "/monitors":
@@ -1722,6 +1862,50 @@ class Handler(BaseHTTPRequestHandler):
             st["tokens"] += max(0, min(200000, i_("tokens", 0)))
             VISION["calls"] = st["calls"]; VISION["tokens"] = st["tokens"]
             save_cfg(); st["left"] = max(0, st["budget"] - st["tokens"]); self._json(st); return
+        if u.path == "/mem":
+            if any(k in q for k in ("on", "keep", "min_gap", "dir")):
+                if "on" in q:
+                    ARCH["on"] = str(q.get("on", "")).strip().lower() in ("1", "true", "yes", "on")
+                if "keep" in q:
+                    ARCH["keep"] = max(20, min(20000, i_("keep", 1200)))
+                if "min_gap" in q:
+                    ARCH["min_gap"] = max(0.5, min(600.0, f("min_gap", 3.0)))
+                if "dir" in q:
+                    ARCH["dir"] = str(q.get("dir") or "").strip()
+                    try:
+                        os.makedirs(_arch_dir(), exist_ok=True)
+                    except Exception as e:
+                        ARCH["err"] = repr(e)[:160]
+                save_cfg()
+            ents = _arch_read(i_("limit", 20), f("since", 0.0), q.get("q", ""))
+            st = arch_state()
+            st["ok"] = True
+            st["n"] = len(ents)
+            st["entries"] = [{"i": k, "ts": e.get("ts"),
+                              "time": time.strftime("%H:%M:%S", time.localtime(float(e.get("ts") or 0))),
+                              "title": e.get("title"), "score": e.get("score"), "file": e.get("file"),
+                              "w": e.get("w"), "h": e.get("h"), "kb": round(float(e.get("bytes") or 0) / 1024.0, 1)}
+                             for k, e in enumerate(ents)]
+            st["hint"] = "看那张图：GET /mem/frame?i=-1（或 ?ts=…）；列表按时间正序，i=-1 是最新一张"
+            self._json(st); return
+        if u.path == "/mem/frame":
+            ents = _arch_read(0)
+            if not ents:
+                self._json({"ok": False, "error": "empty"}); return
+            if "ts" in q:
+                t = f("ts", 0.0)
+                ent = min(ents, key=lambda e: abs(float(e.get("ts") or 0) - t))
+            else:
+                k = i_("i", -1)
+                ent = ents[k] if -len(ents) <= k < len(ents) else ents[-1]
+            try:
+                with open(os.path.join(_arch_dir(), str(ent.get("file") or "")), "rb") as fh:
+                    d = fh.read()
+            except Exception as e:
+                self._json({"ok": False, "error": repr(e)[:160]}); return
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self._cors()
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(d))); self.end_headers(); self.wfile.write(d); return
         if u.path in ("/live", "/peek"):
             items = snapshot() or wait_ring()
             if not items: self._json({"error": "no frames"}); return
