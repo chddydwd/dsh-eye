@@ -1,6 +1,6 @@
 {
   "name": "dsh-eye",
-  "version": "0.4.3",
+  "version": "0.4.4",
   "description": "鲸鲸的眼睛：常驻内存环采屏（20fps/15s）＋读字＋看一眼（取图/区域/回看联络表）＋聚焦圈（只看需要的那块）＋动作回声，侧边栏开关在手",
   "type": "module",
   "main": "lib/index.js",
