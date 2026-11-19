@@ -16,7 +16,7 @@
         "en": "dsh-eye"
       },
       "description": {
-        "zh": "给 AI 装一双「看得见刚才」的眼睛：本地内存环采屏幕，能回看刚才几十秒、按需取 1:1 原像素、读窗口文字、按名字找控件（只报坐标不代点）、隐私打码，全程本机不上传。仅 Windows。",
+        "zh": "给 AI 装一双「看得见刚才」的眼睛：内存环采屏 + 读字 + 看一眼（一屏/区域/回看），侧栏开关在手",
         "en": "Local screen ring for DSH: rewind the last ~45s, recall frames, read window text via UI Automation, locate controls by name (coordinates only), mask private regions."
       },
       "author": "chddydwd",
@@ -24,12 +24,12 @@
       "repository": "https://github.com/chddydwd/dsh-eye",
       "versions": [
         {
-          "version": "0.2.1",
-          "publishTimestamp": 1795065973,
+          "version": "0.3.0",
+          "publishTimestamp": 1795072909,
           "source": {
             "type": "git",
             "url": "https://github.com/chddydwd/dsh-eye.git",
-            "commit": "e7f8325bbd730965b8333132977e7773a5f29664"
+            "commit": "19713069f0c0b92d873ad7ccff794d7b117bfbf8"
           },
           "engines": {
             "dsh": ">=0.2.0"
