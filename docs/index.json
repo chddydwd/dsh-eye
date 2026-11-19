@@ -1,0 +1,41 @@
+{
+  "format": 1,
+  "title": {
+    "zh": "鲸鲸的插件",
+    "en": "Whale Plugins"
+  },
+  "description": {
+    "zh": "鲸鲸自己打包发布的 DSH 插件（自建索引，和社区开放市场互不影响）。",
+    "en": "Self-hosted index for DSH plugins built by chddydwd."
+  },
+  "plugins": [
+    {
+      "name": "dsh-eye",
+      "title": {
+        "zh": "dsh-eye（鲸鲸的眼睛）",
+        "en": "dsh-eye"
+      },
+      "description": {
+        "zh": "给 AI 装一双「看得见刚才」的眼睛：本地内存环采屏幕，能回看刚才几十秒、按需取 1:1 原像素、读窗口文字、按名字找控件（只报坐标不代点）、隐私打码，全程本机不上传。仅 Windows。",
+        "en": "Local screen ring for DSH: rewind the last ~45s, recall frames, read window text via UI Automation, locate controls by name (coordinates only), mask private regions."
+      },
+      "author": "chddydwd",
+      "homepage": "https://github.com/chddydwd/dsh-eye",
+      "repository": "https://github.com/chddydwd/dsh-eye",
+      "versions": [
+        {
+          "version": "0.2.0",
+          "publishTimestamp": 1795065525,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/chddydwd/dsh-eye.git",
+            "commit": "74ce2a67638227d432bd002c0855144a6084a00e"
+          },
+          "engines": {
+            "dsh": ">=0.2.0"
+          }
+        }
+      ]
+    }
+  ]
+}
