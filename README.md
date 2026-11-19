@@ -112,6 +112,19 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 - 「大变化」是启发式判断：换前台窗口算硬事件；视频在放、页面滚动这类持续变化不算。仍可能误报或漏报，阈值可调。
 - 灵敏度三档只是放宽/收紧判据（`quiet` ×1.6、`normal` ×1.0、`sensitive` ×0.6），不是保证：`sensitive` 会更灵但也更容易吵，`quiet` 更安静但会漏掉同窗口内的局部大改。
 
+## 给别的 AI 用：技能包
+
+插件装好了，别的 AI 不一定知道"什么时候该读字、什么时候该取图、多贵"。仓库里带了一份给模型看的说明书：`skills/dsh-eye/SKILL.md`（判断表 / 三档参数与成本 / 标准套路 / 会被拒的情况 / 省钱口诀）。
+
+装到本机技能目录，新会话的技能列表里就会多一个 `dsh-eye`：
+
+```powershell
+mkdir "$env:USERPROFILE\.dsh\skills\dsh-eye" -Force
+copy skills\dsh-eye\SKILL.md "$env:USERPROFILE\.dsh\skills\dsh-eye\SKILL.md"
+```
+
+支持 `SKILL.md`（YAML frontmatter + markdown）的其它宿主也能直接放进去用。
+
 ## 许可
 
 MIT
