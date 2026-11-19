@@ -732,7 +732,7 @@ _load_vision()
 # 看过的东西留档（0.4.0 试点）：本地变化够大才把那一帧缩成小图存盘，滚动保留最近 N 张。
 # 目的不是录屏，是「下午三点那个弹窗写的什么」还能翻回来。存的是打过码的画面，跟出图口径一致。
 ARCH = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "err": "", "saved": 0, "last": 0.0, "day": "",
-        "ttl": 7200.0, "last_trim": 0.0}
+        "ttl": 7200.0, "max_mb": 100.0, "last_trim": 0.0}
 # 插件根目录（本文件在 <插件>/python/ 下）——留档默认放 <插件>/archive
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCH_LOCK = threading.Lock()
@@ -743,7 +743,7 @@ def _arch_dir():
 def _arch_index():
     return os.path.join(_arch_dir(), "index.jsonl")
 
-def _arch_read(limit=200, since=0.0, q=""):
+def _arch_read(limit=200, since=0.0, q="", before=0.0, until=0.0):
     out = []
     try:
         with open(_arch_index(), "r", encoding="utf-8") as f:
@@ -764,6 +764,10 @@ def _arch_read(limit=200, since=0.0, q=""):
         return []
     if since:
         out = [e for e in out if float(e.get("ts") or 0) >= float(since)]
+    if until:
+        out = [e for e in out if float(e.get("ts") or 0) <= float(until)]
+    if before:
+        out = [e for e in out if float(e.get("ts") or 0) < float(before)]
     if q:
         qq = str(q).lower()
         out = [e for e in out if qq in str(e.get("title") or "").lower() or qq in str(e.get("note") or "").lower()]
@@ -773,7 +777,7 @@ def _arch_read(limit=200, since=0.0, q=""):
     return out
 
 def _load_archive():
-    d = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "ttl": 7200.0}
+    d = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "ttl": 7200.0, "max_mb": 100.0}
     try:
         with open(CFG_PATH, "r", encoding="utf-8") as f:
             a = (json.load(f) or {}).get("archive")
@@ -798,6 +802,10 @@ def _load_archive():
     except Exception:
         ARCH["ttl"] = 7200.0
     try:
+        ARCH["max_mb"] = max(10.0, min(4096.0, float(d.get("max_mb") or 100.0)))
+    except Exception:
+        ARCH["max_mb"] = 100.0
+    try:
         os.makedirs(_arch_dir(), exist_ok=True)
     except Exception as e:
         ARCH["err"] = repr(e)[:160]
@@ -814,6 +822,12 @@ def _arch_trim(force=False):
     if not force and aged == 0 and len(entries) <= keep * 1.25:
         return
     keepers = fresh[-keep:] if len(fresh) > keep else fresh
+    # 容量闸：按总字节从最老的开始删，直到不超过 max_mb
+    budget = float(ARCH["max_mb"] or 100.0) * 1024.0 * 1024.0
+    total = sum(float(e.get("bytes") or 0) for e in keepers)
+    while keepers and total > budget:
+        total -= float(keepers[0].get("bytes") or 0)
+        keepers = keepers[1:]
     files = set(str(e.get("file") or "") for e in keepers)
     try:
         tmp = _arch_index() + ".tmp"
@@ -875,9 +889,15 @@ def arch_state():
             oldest = round(time.time() - float(ents[0].get("ts") or 0), 0)
     except Exception:
         pass
+    total = 0.0
+    try:
+        total = sum(float(e.get("bytes") or 0) for e in _arch_read(0))
+    except Exception:
+        pass
     return {"on": bool(ARCH["on"]), "dir": _arch_dir(), "keep": int(ARCH["keep"]),
             "min_gap": float(ARCH["min_gap"]), "saved": int(ARCH["saved"]), "err": ARCH["err"],
             "ttl_hours": round(float(ARCH["ttl"]) / 3600.0, 2), "oldest_ago": oldest,
+            "max_mb": float(ARCH["max_mb"]), "mb": round(total / 1048576.0, 1),
             "last_ago": (round(time.time() - float(ARCH["last"]), 1) if ARCH["last"] else None)}
 
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
@@ -1145,7 +1165,7 @@ def save_cfg():
                             "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"])}
         payload["archive"] = {"on": bool(ARCH["on"]), "min_gap": float(ARCH["min_gap"]),
                               "keep": int(ARCH["keep"]), "dir": str(ARCH["dir"]),
-                              "ttl": float(ARCH["ttl"])}
+                              "ttl": float(ARCH["ttl"]), "max_mb": float(ARCH["max_mb"])}
         payload["vision"] = {"on": bool(VISION["on"]), "budget": int(VISION["budget"]),
                              "calls": int(VISION["calls"]), "tokens": int(VISION["tokens"]), "day": str(VISION["day"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
@@ -1887,7 +1907,7 @@ class Handler(BaseHTTPRequestHandler):
             VISION["calls"] = st["calls"]; VISION["tokens"] = st["tokens"]
             save_cfg(); st["left"] = max(0, st["budget"] - st["tokens"]); self._json(st); return
         if u.path == "/mem":
-            if any(k in q for k in ("on", "keep", "min_gap", "dir", "ttl")):
+            if any(k in q for k in ("on", "keep", "min_gap", "dir", "ttl", "max_mb")):
                 if "on" in q:
                     ARCH["on"] = str(q.get("on", "")).strip().lower() in ("1", "true", "yes", "on")
                 if "keep" in q:
@@ -1896,6 +1916,8 @@ class Handler(BaseHTTPRequestHandler):
                     ARCH["min_gap"] = max(0.5, min(600.0, f("min_gap", 3.0)))
                 if "ttl" in q:
                     ARCH["ttl"] = max(60.0, min(7 * 86400.0, f("ttl", 7200.0)))
+                if "max_mb" in q:
+                    ARCH["max_mb"] = max(10.0, min(4096.0, f("max_mb", 100.0)))
                 if "trim" in q:
                     _arch_trim(force=True)
                 if "dir" in q:
@@ -1905,17 +1927,32 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception as e:
                         ARCH["err"] = repr(e)[:160]
                 save_cfg()
-            ents = _arch_read(i_("limit", 20), f("since", 0.0), q.get("q", ""))
+            lim = i_("limit", 20)
+            b4 = f("before", 0.0)
+            ents = _arch_read(lim, f("since", 0.0), q.get("q", ""), b4, f("to", 0.0))
             st = arch_state()
+            all_n = len(_arch_read(0))
             st["ok"] = True
             st["n"] = len(ents)
-            st["entries"] = [{"i": k, "ts": e.get("ts"),
+            st["entries"] = [{"i": k - len(ents), "ts": e.get("ts"),
                               "time": time.strftime("%H:%M:%S", time.localtime(float(e.get("ts") or 0))),
                               "title": e.get("title"), "score": e.get("score"), "file": e.get("file"),
                               "w": e.get("w"), "h": e.get("h"), "kb": round(float(e.get("bytes") or 0) / 1024.0, 1)}
                              for k, e in enumerate(ents)]
-            st["hint"] = "看那张图：GET /mem/frame?i=-1（或 ?ts=…）；列表按时间正序，i=-1 是最新一张"
+            more = _arch_read(1, f("since", 0.0), q.get("q", ""), (float(ents[0].get("ts")) if ents else 0.0), f("to", 0.0))
+            st["total"] = all_n
+            st["next_before"] = round(float(ents[0].get("ts")), 3) if (ents and more) else None
+            st["has_more"] = bool(ents and more)
+            st["hint"] = "看那张图：GET /mem/frame?i=-1（或 ?ts=…）；列表按时间正序，i=-1 是最新一张。还有更早的：加 &before=<next_before>"
             self._json(st); return
+        if u.path == "/mem/open":
+            try:
+                os.makedirs(_arch_dir(), exist_ok=True)
+                os.startfile(_arch_dir())
+                self._json({"ok": True, "dir": _arch_dir()})
+            except Exception as e:
+                self._json({"ok": False, "error": repr(e)[:160]})
+            return
         if u.path == "/mem/frame":
             ents = _arch_read(0)
             if not ents:
