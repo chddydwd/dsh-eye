@@ -632,6 +632,34 @@ def _load_follow():
         pass
 _load_follow()
 
+# 视觉取图（0.3.0）：允许模型主动「看一眼」——当前一屏 / 一块区域 / 最近几秒。
+# 关掉 = 只读字、不出图（隐私开关）。预算按「今天估算消耗了多少 token」算，超了就停，面板里能看到。
+VISION = {"on": True, "budget": 300000, "calls": 0, "tokens": 0, "day": ""}
+
+def vision_state():
+    """今天的用量。过了零点自动清零，不然「今天花了多少」永远是个累计数。"""
+    today = time.strftime("%Y-%m-%d")
+    if VISION["day"] != today:
+        VISION["day"] = today
+        VISION["calls"] = 0
+        VISION["tokens"] = 0
+    return dict(VISION)
+
+def _load_vision():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            v = (json.load(f) or {}).get("vision") or {}
+        if isinstance(v, dict):
+            VISION["on"] = bool(v.get("on", True))
+            VISION["budget"] = max(1000, int(v.get("budget") or 300000))
+            VISION["calls"] = max(0, int(v.get("calls") or 0))
+            VISION["tokens"] = max(0, int(v.get("tokens") or 0))
+            VISION["day"] = str(v.get("day") or "")
+    except Exception:
+        pass
+    vision_state()   # 跨天就清零（只算今天）
+_load_vision()
+
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
 # 这样改过抓取范围、换过屏，框还贴在同一块屏幕上，不会跟偏。只是画面模糊，不等于加密。
 MASK = {"on": True, "rects": [], "auto": []}
@@ -892,6 +920,8 @@ def save_cfg():
                            "pwd": bool(PWD["on"])}
         payload["sensitive"] = {"on": bool(SENS["on"]), "words": list(SENS["words"])}
         payload["follow"] = {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}
+        payload["vision"] = {"on": bool(VISION["on"]), "budget": int(VISION["budget"]),
+                             "calls": int(VISION["calls"]), "tokens": int(VISION["tokens"]), "day": str(VISION["day"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception:
@@ -1523,6 +1553,35 @@ class Handler(BaseHTTPRequestHandler):
                 x0 = max(0, min(FW - fw, cx - fw // 2)); y0 = max(0, min(FH - fh, cy - fh // 2))
                 im = im.crop((x0, y0, x0 + fw, y0 + fh))
             self._img(im); return
+        if u.path in ("/story", "/sheet_ai"):
+            win = window(f("span", 10.0), i_("n", 6))
+            if not win: self._json({"error": "no frames"}); return
+            cols = max(1, min(6, i_("cols", 3)))
+            w = max(320, min(1600, i_("w", 1280)))
+            im = render_sheet(win, cols, width=w)
+            if im is None: self._json({"error": "no frames"}); return
+            if im.size[0] != w:
+                im = im.resize((w, max(1, int(im.size[1] * w / im.size[0]))), Image.BILINEAR)
+            b = io.BytesIO(); im.save(b, "JPEG", quality=max(40, min(90, i_("q", 72)))); d = b.getvalue()
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self._cors()
+            self.send_header("Cache-Control", "no-store"); self.send_header("Content-Length", str(len(d)))
+            self.end_headers(); self.wfile.write(d); return
+        if u.path == "/vision":
+            if "on" in q:
+                VISION["on"] = str(q.get("on", "")).strip().lower() in ("1", "true", "yes", "on")
+            if "budget" in q:
+                VISION["budget"] = max(1000, min(5000000, i_("budget", 300000)))
+            if "reset" in q:
+                vision_state(); VISION["calls"] = 0; VISION["tokens"] = 0
+            if any(k in q for k in ("on", "budget", "reset")):
+                save_cfg()
+            st = vision_state(); st["left"] = max(0, st["budget"] - st["tokens"]); self._json(st); return
+        if u.path == "/vision/use":
+            st = vision_state()
+            st["calls"] += 1
+            st["tokens"] += max(0, min(200000, i_("tokens", 0)))
+            VISION["calls"] = st["calls"]; VISION["tokens"] = st["tokens"]
+            save_cfg(); st["left"] = max(0, st["budget"] - st["tokens"]); self._json(st); return
         if u.path in ("/live", "/peek"):
             items = snapshot() or wait_ring()
             if not items: self._json({"error": "no frames"}); return
