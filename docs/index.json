@@ -24,12 +24,12 @@
       "repository": "https://github.com/chddydwd/dsh-eye",
       "versions": [
         {
-          "version": "0.3.3",
-          "publishTimestamp": 1795075390,
+          "version": "0.3.4",
+          "publishTimestamp": 1795075682,
           "source": {
             "type": "git",
             "url": "https://github.com/chddydwd/dsh-eye.git",
-            "commit": "48b75641319eb6323ac73a0414ad1a3836fe2049"
+            "commit": "866b991cda125b96b3284ba6b36cefbbeaf825f4"
           },
           "engines": {
             "dsh": ">=0.2.0"
