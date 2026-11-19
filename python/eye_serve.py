@@ -335,7 +335,7 @@ def capture():
         try:
             mons = s.monitors
             idx = MON["i"] if 0 <= MON["i"] < len(mons) else (1 if len(mons) > 1 else 0)
-            raw = s.grab(follow_box() or region_box() or mons[idx])   # 跟随/框选/选中屏每帧现读，改完立刻生效
+            raw = s.grab(focus_box() or follow_box() or region_box() or mons[idx])   # 聚焦/跟随/框选/选中屏每帧现读，改完立刻生效
             im = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
             b = io.BytesIO(); im.save(b, "JPEG", quality=Q, subsampling=SS)
             ts = time.time()
@@ -632,6 +632,75 @@ def _load_follow():
         pass
 _load_follow()
 
+# 聚焦圈（0.3.3）：模型自己决定只看哪一块（人话：你说「看这个报错框」，我就把取景框挪过去）。
+# 开着时抓帧只抓这块——像素少、token 少，同样预算下细节更清楚。绑定窗口时跟着窗口走。
+FOCUS = {"on": False, "x": 0, "y": 0, "w": 0, "h": 0, "hwnd": 0, "follow": True, "label": ""}
+
+def _load_focus():
+    try:
+        with open(CFG_PATH, "r", encoding="utf-8") as f:
+            r = (json.load(f) or {}).get("focus")
+        if isinstance(r, dict):
+            FOCUS["on"] = bool(r.get("on", False))
+            for k in ("x", "y", "w", "h"):
+                FOCUS[k] = int(r.get(k) or 0)
+            FOCUS["hwnd"] = int(r.get("hwnd") or 0)
+            FOCUS["follow"] = bool(r.get("follow", True))
+            FOCUS["label"] = str(r.get("label") or "")[:60]
+    except Exception:
+        pass
+_load_focus()
+
+def _focus_screen_rect():
+    """聚焦块换算成屏幕矩形：绑了窗口且跟随，就每帧按窗口现位置算（窗口拖动/改大小也跟得上）。"""
+    x, y, w, h = int(FOCUS["x"]), int(FOCUS["y"]), int(FOCUS["w"]), int(FOCUS["h"])
+    if FOCUS["hwnd"] and FOCUS["follow"]:
+        r = _win_rect(int(FOCUS["hwnd"]))
+        if r:
+            return r[0], r[1], r[2], r[3]
+    return x, y, w, h
+
+def focus_box():
+    """当前聚焦块（mss 用的 dict）；没开或太小就返回 None。"""
+    if not FOCUS["on"]:
+        return None
+    x, y, w, h = _focus_screen_rect()
+    mb = mon_box()
+    if w < 80 or h < 60:
+        return None
+    x = max(int(mb["left"]), min(int(x), int(mb["left"]) + int(mb["width"]) - 80))
+    y = max(int(mb["top"]), min(int(y), int(mb["top"]) + int(mb["height"]) - 60))
+    w = max(80, min(int(w), int(mb["left"]) + int(mb["width"]) - x))
+    h = max(60, min(int(h), int(mb["top"]) + int(mb["height"]) - y))
+    return {"left": x, "top": y, "width": w, "height": h}
+
+def find_windows_by_title(sub):
+    """按标题子串找顶层窗口（给「盯住那个面板」用），返回 [{hwnd, title, rect}]，大的在前。"""
+    out = []
+    sub = (sub or "").strip().lower()
+    if not sub:
+        return out
+    try:
+        from ctypes import wintypes
+        EnumProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lp):
+            try:
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                t = win_title(int(hwnd))
+                if sub in t.lower():
+                    r = _win_rect(int(hwnd))
+                    if r:
+                        out.append({"hwnd": int(hwnd), "title": t[:120], "rect": r})
+            except Exception:
+                pass
+            return True
+        user32.EnumWindows(EnumProc(_cb), 0)
+    except Exception:
+        pass
+    out.sort(key=lambda o: -(o["rect"][2] * o["rect"][3]))
+    return out[:8]
+
 # 视觉取图（0.3.0）：允许模型主动「看一眼」——当前一屏 / 一块区域 / 最近几秒。
 # 关掉 = 只读字、不出图（隐私开关）。预算按「今天估算消耗了多少 token」算，超了就停，面板里能看到。
 VISION = {"on": True, "budget": 300000, "calls": 0, "tokens": 0, "day": ""}
@@ -904,8 +973,8 @@ def follow_box():
     return {"left": left, "top": top, "width": fw, "height": fh}
 
 def base_box():
-    """这一帧实际抓的矩形：跟随鼠标 > 框选区域 > 当前选中的那块屏。"""
-    return follow_box() or region_box() or mon_box()
+    """这一帧实际抓的矩形：聚焦圈 > 跟随鼠标 > 框选区域 > 当前选中的那块屏。"""
+    return focus_box() or follow_box() or region_box() or mon_box()
 
 def frame_size():
     b = base_box()
@@ -920,6 +989,9 @@ def save_cfg():
                            "pwd": bool(PWD["on"])}
         payload["sensitive"] = {"on": bool(SENS["on"]), "words": list(SENS["words"])}
         payload["follow"] = {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}
+        payload["focus"] = {"on": bool(FOCUS["on"]), "x": int(FOCUS["x"]), "y": int(FOCUS["y"]),
+                            "w": int(FOCUS["w"]), "h": int(FOCUS["h"]), "hwnd": int(FOCUS["hwnd"]),
+                            "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"])}
         payload["vision"] = {"on": bool(VISION["on"]), "budget": int(VISION["budget"]),
                              "calls": int(VISION["calls"]), "tokens": int(VISION["tokens"]), "day": str(VISION["day"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
@@ -1313,7 +1385,7 @@ class Handler(BaseHTTPRequestHandler):
             span = (items[-1][0] - items[0][0]) if len(items) > 1 else 0
             x, y = get_cursor()
             self._json({"frames": len(items), "fps": stats["fps"], "frame_ms": stats.get("ms"), "span_sec": round(span, 2),
-                        "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "follow": {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}, "cursor": [x, y], "clicks": len(clicks),
+                        "size": list(frame_size()), "screen": [W, H], "region": dict(REGION), "follow": {"on": bool(FOLLOW["on"]), "w": int(FOLLOW["w"]), "h": int(FOLLOW["h"])}, "focus": {"on": bool(FOCUS["on"]), "box": list(focus_box().values()) if focus_box() else [], "hwnd": int(FOCUS["hwnd"]), "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"])}, "cursor": [x, y], "clicks": len(clicks),
                         "monitor": dict({"i": MON["i"]}, **mon_box()), "monitors": monitor_list(), "dpi": DPI, "refresh": REFRESH,
                         "mask": {"on": bool(MASK["on"]), "count": len(MASK["rects"]), "rects": [list(r) for r in MASK["rects"]],
                                  "coord": "screen", "pwd": bool(PWD["on"]), "auto": len(MASK["auto"]), "auto_err": PWD["err"],
@@ -1407,6 +1479,74 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "hint": "拖一个框，松手生效；点一下不拖或按 Esc = 恢复全屏"}); return
             except Exception as e:
                 self._json({"ok": False, "error": repr(e)}); return
+        if u.path == "/focus":
+            # 聚焦圈（0.3.3）：模型按用户的话把取景框挪过去；之后抓帧只抓这块。
+            # 参数：clear/off 清除；x,y,w,h 一块矩形；hwnd=N 绑窗口；title=子串 按标题找窗口；follow=0/1 跟不跟窗口；label 备注
+            touched = False
+            prev = focus_box()
+            if ("clear" in q) or ("off" in q):
+                FOCUS.update({"on": False, "hwnd": 0, "label": ""}); touched = True
+            if "front" in q:
+                try:
+                    h0 = int(user32.GetForegroundWindow() or 0)
+                except Exception:
+                    h0 = 0
+                r0 = _win_rect(h0) if h0 else []
+                if not r0:
+                    self._json({"ok": False, "error": "拿不到前台窗口（可能刚切走）"}); return
+                FOCUS.update({"on": True, "hwnd": h0, "x": r0[0], "y": r0[1], "w": r0[2], "h": r0[3],
+                              "follow": True, "label": (str(q.get("label") or "") or win_title(h0)[:60])})
+                touched = True
+            if "title" in q and "front" not in q:
+                cands = find_windows_by_title(str(q.get("title") or ""))
+                if not cands:
+                    self._json({"ok": False, "error": "没找到标题含「" + str(q.get("title"))[:40] + "」的窗口",
+                                "hint": "换个更短的关键词；或先调 eye_text 看看前台窗口叫什么"}); return
+                w0 = cands[0]
+                FOCUS.update({"on": True, "hwnd": w0["hwnd"], "x": w0["rect"][0], "y": w0["rect"][1],
+                              "w": w0["rect"][2], "h": w0["rect"][3],
+                              "follow": True, "label": (str(q.get("label") or "") or w0["title"])[:60]})
+                touched = True
+            if "hwnd" in q and "title" not in q:
+                h0 = i_("hwnd", 0)
+                r0 = _win_rect(h0) if h0 else []
+                if not r0:
+                    self._json({"ok": False, "error": "这个 hwnd 拿不到窗口矩形（窗口没了或不可见）"}); return
+                FOCUS.update({"on": True, "hwnd": h0, "x": r0[0], "y": r0[1], "w": r0[2], "h": r0[3],
+                              "follow": True, "label": (str(q.get("label") or "") or win_title(h0)[:60])})
+                touched = True
+            if "w" in q and "h" in q and "title" not in q and i_("w", 0) >= 80 and i_("h", 0) >= 60:
+                FOCUS.update({"on": True, "hwnd": 0, "x": i_("x", 0), "y": i_("y", 0),
+                              "w": i_("w", 0), "h": i_("h", 0),
+                              "follow": False, "label": (str(q.get("label") or "") or "手定区域")[:60]})
+                touched = True
+            if "follow" in q:
+                FOCUS["follow"] = str(q.get("follow")).strip().lower() not in ("0", "false", "off", "no")
+                touched = True
+            if "on" in q:
+                FOCUS["on"] = str(q.get("on")).strip().lower() not in ("0", "false", "off", "no")
+                touched = True
+            if "label" in q and touched:
+                FOCUS["label"] = str(q.get("label") or "")[:60]
+            bx = focus_box()
+            if touched:
+                a = (prev["left"], prev["top"], prev["width"], prev["height"]) if prev else None
+                b = (bx["left"], bx["top"], bx["width"], bx["height"]) if bx else None
+                if a != b:
+                    with lock:
+                        ring.clear(); stats["n"] = 0
+                    slow.clear(); slow_bytes[0] = 0
+                    act["box"] = None; act["score"] = 0.0
+                save_cfg()
+            fmode = "focus" if bx else ("follow" if FOLLOW["on"] else ("region" if region_box() else "full"))
+            self._json({"ok": True, "on": bool(FOCUS["on"]),
+                        "box": [bx["left"], bx["top"], bx["width"], bx["height"]] if bx else [],
+                        "hwnd": int(FOCUS["hwnd"]), "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"]),
+                        "size": list(frame_size()), "screen": [W, H], "mode": fmode,
+                        "hint": ("聚焦中：" + str(bx["width"]) + "x" + str(bx["height"]) +
+                                 ("（跟窗口走）" if FOCUS["hwnd"] and FOCUS["follow"] else "（固定不动）") +
+                                 "；之后所有取图只抓这块，读字仍读前台窗口")
+                                if bx else "没聚焦，按整屏（或跟随/框选）抓"}); return
         if u.path == "/mask":
             if "off" in q:
                 MASK["on"] = False
