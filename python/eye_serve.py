@@ -731,11 +731,14 @@ _load_vision()
 
 # 看过的东西留档（0.4.0 试点）：本地变化够大才把那一帧缩成小图存盘，滚动保留最近 N 张。
 # 目的不是录屏，是「下午三点那个弹窗写的什么」还能翻回来。存的是打过码的画面，跟出图口径一致。
-ARCH = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "err": "", "saved": 0, "last": 0.0, "day": ""}
+ARCH = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "err": "", "saved": 0, "last": 0.0, "day": "",
+        "ttl": 7200.0, "last_trim": 0.0}
+# 插件根目录（本文件在 <插件>/python/ 下）——留档默认放 <插件>/archive
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ARCH_LOCK = threading.Lock()
 
 def _arch_dir():
-    return ARCH["dir"] or os.path.join(os.path.expanduser("~"), ".dsh", "eye-archive")
+    return ARCH["dir"] or os.path.join(PLUGIN_ROOT, "archive")
 
 def _arch_index():
     return os.path.join(_arch_dir(), "index.jsonl")
@@ -770,7 +773,7 @@ def _arch_read(limit=200, since=0.0, q=""):
     return out
 
 def _load_archive():
-    d = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": ""}
+    d = {"on": True, "min_gap": 3.0, "keep": 1200, "dir": "", "ttl": 7200.0}
     try:
         with open(CFG_PATH, "r", encoding="utf-8") as f:
             a = (json.load(f) or {}).get("archive")
@@ -791,18 +794,26 @@ def _load_archive():
         ARCH["keep"] = 1200
     ARCH["dir"] = str(d.get("dir") or "").strip()
     try:
+        ARCH["ttl"] = max(60.0, min(7 * 86400.0, float(d.get("ttl") or 7200.0)))
+    except Exception:
+        ARCH["ttl"] = 7200.0
+    try:
         os.makedirs(_arch_dir(), exist_ok=True)
     except Exception as e:
         ARCH["err"] = repr(e)[:160]
     ARCH["saved"] = len(_arch_read(0))
 _load_archive()
 
-def _arch_trim():
+def _arch_trim(force=False):
+    """两条红线：超过 ttl（默认 2 小时）的删掉；总量超过 keep 的删最早。"""
     keep = int(ARCH["keep"])
     entries = _arch_read(0)
-    if len(entries) <= keep * 1.25:
+    cutoff = time.time() - float(ARCH["ttl"] or 7200.0)
+    fresh = [e for e in entries if float(e.get("ts") or 0) >= cutoff]
+    aged = len(entries) - len(fresh)
+    if not force and aged == 0 and len(entries) <= keep * 1.25:
         return
-    keepers = entries[-keep:]
+    keepers = fresh[-keep:] if len(fresh) > keep else fresh
     files = set(str(e.get("file") or "") for e in keepers)
     try:
         tmp = _arch_index() + ".tmp"
@@ -819,6 +830,9 @@ def _arch_trim():
     except Exception as e:
         ARCH["err"] = repr(e)[:160]
     ARCH["saved"] = len(keepers)
+    ARCH["last_trim"] = time.time()
+    if aged:
+        ARCH["last_aged"] = aged
 
 def arch_save(ts, im, score=0.0, note=""):
     """变化够大时存一张缩略图（先打码）+ 索引一行。失败只记错，不影响采集。"""
@@ -848,13 +862,22 @@ def arch_save(ts, im, score=0.0, note=""):
                 f.write(json.dumps(e, ensure_ascii=False) + "\n")
             ARCH["saved"] = int(ARCH["saved"]) + 1
             ARCH["last"] = ts
-        _arch_trim()
+        if time.time() - float(ARCH.get("last_trim") or 0) > 120.0:
+            _arch_trim()
     except Exception as e:
         ARCH["err"] = repr(e)[:160]
 
 def arch_state():
+    oldest = None
+    try:
+        ents = _arch_read(0)
+        if ents:
+            oldest = round(time.time() - float(ents[0].get("ts") or 0), 0)
+    except Exception:
+        pass
     return {"on": bool(ARCH["on"]), "dir": _arch_dir(), "keep": int(ARCH["keep"]),
             "min_gap": float(ARCH["min_gap"]), "saved": int(ARCH["saved"]), "err": ARCH["err"],
+            "ttl_hours": round(float(ARCH["ttl"]) / 3600.0, 2), "oldest_ago": oldest,
             "last_ago": (round(time.time() - float(ARCH["last"]), 1) if ARCH["last"] else None)}
 
 # 隐私打码：把指定矩形糊成马赛克再往外发。矩形存的是「屏幕坐标」，出图时按当前抓取区域折算到帧内——
@@ -1121,7 +1144,8 @@ def save_cfg():
                             "w": int(FOCUS["w"]), "h": int(FOCUS["h"]), "hwnd": int(FOCUS["hwnd"]),
                             "follow": bool(FOCUS["follow"]), "label": str(FOCUS["label"])}
         payload["archive"] = {"on": bool(ARCH["on"]), "min_gap": float(ARCH["min_gap"]),
-                              "keep": int(ARCH["keep"]), "dir": str(ARCH["dir"])}
+                              "keep": int(ARCH["keep"]), "dir": str(ARCH["dir"]),
+                              "ttl": float(ARCH["ttl"])}
         payload["vision"] = {"on": bool(VISION["on"]), "budget": int(VISION["budget"]),
                              "calls": int(VISION["calls"]), "tokens": int(VISION["tokens"]), "day": str(VISION["day"])}
         with open(CFG_PATH, "w", encoding="utf-8") as f:
@@ -1863,13 +1887,17 @@ class Handler(BaseHTTPRequestHandler):
             VISION["calls"] = st["calls"]; VISION["tokens"] = st["tokens"]
             save_cfg(); st["left"] = max(0, st["budget"] - st["tokens"]); self._json(st); return
         if u.path == "/mem":
-            if any(k in q for k in ("on", "keep", "min_gap", "dir")):
+            if any(k in q for k in ("on", "keep", "min_gap", "dir", "ttl")):
                 if "on" in q:
                     ARCH["on"] = str(q.get("on", "")).strip().lower() in ("1", "true", "yes", "on")
                 if "keep" in q:
                     ARCH["keep"] = max(20, min(20000, i_("keep", 1200)))
                 if "min_gap" in q:
                     ARCH["min_gap"] = max(0.5, min(600.0, f("min_gap", 3.0)))
+                if "ttl" in q:
+                    ARCH["ttl"] = max(60.0, min(7 * 86400.0, f("ttl", 7200.0)))
+                if "trim" in q:
+                    _arch_trim(force=True)
                 if "dir" in q:
                     ARCH["dir"] = str(q.get("dir") or "").strip()
                     try:
